@@ -63,6 +63,22 @@ def initialize(context):
     run_daily(market_open_trade, time='10:00')
     run_daily(after_market_close, time='15:00')# 统一在10:00交易
 
+def _is_st_or_delist(stock, current_data=None):
+    """排除 ST / *ST / 退市风险股（is_st 标志 + 名称）"""
+    if current_data is None:
+        current_data = get_current_data()
+    cd = current_data[stock]
+    if cd.is_st:
+        return True
+    info = get_security_info(stock)
+    if info is None:
+        return True
+    name = (info.display_name or '') + (getattr(cd, 'name', '') or '')
+    for kw in ('ST', '※ST', '*ST', '退'):
+        if kw in name:
+            return True
+    return False
+
 def get_market_score(context):
     """
     大盘趋势评分（来自趋势跟踪策略）
@@ -348,28 +364,13 @@ def market_open_trade(context):
             if not np.isfinite(current_price) or current_price <= 0:
                 continue
 
-            # ← 新增：排除ST、涨停、不可交易板块
             code_pure = stock.split('.')[0]
-            if current_data[stock].is_st:
-                log.info(f"{stock} ST股票，跳过")
+            if _is_st_or_delist(stock, current_data):
+                log.info(f"{stock} ST/*ST/退市股，跳过")
                 continue
             if code_pure.startswith(('8','9','43','83','87')):
                 log.info(f"{stock} 北交所/新三板，跳过")
                 continue
-            # 涨停不能买
-            if current_price >= current_data[stock].high_limit * 0.998:
-                log.info(f"{stock} 涨停或接近涨停，跳过")
-                continue
-
-            # ← 新增：排除ST、涨停、不可交易板块
-            code_pure = stock.split('.')[0]
-            if current_data[stock].is_st:
-                log.info(f"{stock} ST股票，跳过")
-                continue
-            if code_pure.startswith(('8','9','43','83','87')):
-                log.info(f"{stock} 北交所/新三板，跳过")
-                continue
-            # 涨停不能买
             if current_price >= current_data[stock].high_limit * 0.998:
                 log.info(f"{stock} 涨停或接近涨停，跳过")
                 continue
@@ -673,8 +674,7 @@ def get_canslim_pool(context):
     for s in stocks:
         code_pure = s.split('.')[0]
 
-        # ← 新增：排除ST
-        if current_data[s].is_st:
+        if _is_st_or_delist(s, current_data):
             continue
 
         # 排除指数
