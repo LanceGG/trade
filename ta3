@@ -13,7 +13,7 @@
 # trade2 单点回撤优化系列 — 基于 trade2，每次只改一项，便于 A/B 回测
 # 基准逻辑与 trade2 相同：3只持仓、CANSLIM+价格行为、止损8%+通道3日+双死叉
 
-# ta3 — 基于 ta1：排序在原有动量规则上，每偏离MA20 1个百分点扣1分
+# ta3 — 基于 ta1：大盘分<40 时对所有持仓移动止损线成倍收紧
 
 import talib
 import numpy as np
@@ -57,12 +57,13 @@ def initialize(context):
     g.trail_stop_half = 0.08           # 自高点回撤8% → 减仓50%
     g.trail_stop_full = 0.12           # 自高点回撤12% → 清仓
 
+    # ==================== ta3 弱市移动止损收紧 ====================
+    g.trail_bear_score_threshold = 40    # 大盘分低于此值触发
+    g.trail_bear_tight_mult = 0.5        # 回撤阈值成倍收紧（×0.5：8%→4%，12%→6%）
+
     # ==================== trade2at4at5 动量排序 ====================
     g.momentum_factor_yesterday = 0.5    # 昨日涨跌幅权重：涨1%=+1分
     g.momentum_factor_today = 0.5          # 今日涨跌幅权重：涨1%=+1分
-
-    # ==================== ta3 MA20偏离扣分 ====================
-    g.ma20_deviation_penalty = 1.0       # 偏离MA20每1个百分点扣1分
 
     # ==================== 状态变量 ====================
     g.today_stocks = []                    # 当日精选股票列表
@@ -116,28 +117,43 @@ def _cleanup_position_state(stock):
     g.trail_half_done.pop(stock, None)
 
 
-def _check_profit_trailing(stock, current_price, pnl_ratio):
-    """浮盈>50%时：高点回撤8%减仓50%，回撤12%清仓。返回 'full' / 'half' / None"""
+def _get_trail_stop_levels(market_score):
+    """盈利回撤移动止损阈值；弱市时成倍收紧"""
+    stop_half = g.trail_stop_half
+    stop_full = g.trail_stop_full
+    if market_score < g.trail_bear_score_threshold:
+        stop_half *= g.trail_bear_tight_mult
+        stop_full *= g.trail_bear_tight_mult
+    return stop_half, stop_full
+
+
+def _check_profit_trailing(stock, current_price, pnl_ratio, market_score):
+    """浮盈>50%时：高点回撤减仓/清仓。弱市移动止损线收紧"""
     _update_position_high(stock, current_price)
     if pnl_ratio <= g.trail_profit_threshold:
         return None
     peak = g.position_high.get(stock, current_price)
     if peak <= 0:
         return None
+    stop_half, stop_full = _get_trail_stop_levels(market_score)
     dd_from_peak = (current_price - peak) / peak
-    if dd_from_peak <= -g.trail_stop_full:
+    if dd_from_peak <= -stop_full:
+        bear_tag = '弱市收紧' if market_score < g.trail_bear_score_threshold else ''
         log.info(f"📉 盈利回撤清仓 {stock}，浮盈{pnl_ratio*100:.1f}%，"
-                 f"自高点{peak:.2f}回撤{abs(dd_from_peak*100):.1f}%")
+                 f"自高点{peak:.2f}回撤{abs(dd_from_peak*100):.1f}%"
+                 f" 阈值{stop_full*100:.1f}% {bear_tag}")
         return 'full'
-    if dd_from_peak <= -g.trail_stop_half and not g.trail_half_done.get(stock, False):
+    if dd_from_peak <= -stop_half and not g.trail_half_done.get(stock, False):
+        bear_tag = '弱市收紧' if market_score < g.trail_bear_score_threshold else ''
         log.info(f"📉 盈利回撤减半 {stock}，浮盈{pnl_ratio*100:.1f}%，"
-                 f"自高点{peak:.2f}回撤{abs(dd_from_peak*100):.1f}%")
+                 f"自高点{peak:.2f}回撤{abs(dd_from_peak*100):.1f}%"
+                 f" 阈值{stop_half*100:.1f}% {bear_tag}")
         return 'half'
     return None
 
 
-def _apply_profit_trailing(stock, position, current_price, pnl_ratio, context):
-    action = _check_profit_trailing(stock, current_price, pnl_ratio)
+def _apply_profit_trailing(stock, position, current_price, pnl_ratio, context, market_score):
+    action = _check_profit_trailing(stock, current_price, pnl_ratio, market_score)
     if action == 'full':
         _safe_order_target_value(stock, 0, current_price, 'sell', context)
         _cleanup_position_state(stock)
@@ -191,35 +207,12 @@ def _get_today_return_pct(stock, context):
     return 0.0
 
 
-def _get_ma20_deviation_pct(stock, context):
-    """相对MA20偏离百分点，价在MA20上方为正"""
-    try:
-        hist = attribute_history(stock, 25, '1d', ['close'], skip_paused=True, df=False)
-        if len(hist['close']) < 20:
-            return 0.0
-        ma20 = float(talib.SMA(hist['close'], timeperiod=20)[-1])
-        if not np.isfinite(ma20) or ma20 <= 0:
-            return 0.0
-        cd = get_current_data()[stock]
-        price = cd.last_price
-        if not np.isfinite(price) or price <= 0:
-            price = cd.day_open
-        if not np.isfinite(price) or price <= 0:
-            price = float(hist['close'][-1])
-        return float((price - ma20) / ma20 * 100)
-    except Exception:
-        return 0.0
-
-
 def _apply_momentum_score(base_score, stock, context, include_today=False):
-    """形态基础分 + 昨/今动量分 − MA20偏离扣分"""
+    """形态基础分 + 昨/今动量分（涨1%=+1，跌1%=-1）"""
     y = _get_yesterday_return_pct(stock, context) * g.momentum_factor_yesterday
     t = (_get_today_return_pct(stock, context) * g.momentum_factor_today
          if include_today else 0.0)
-    dev = _get_ma20_deviation_pct(stock, context)
-    ma20_pen = abs(dev) * g.ma20_deviation_penalty
-    score = base_score + y + t - ma20_pen
-    return score, y, t, dev, ma20_pen
+    return base_score + y + t, y, t
 
 
 def _log_momentum_stats(pool, label):
@@ -239,15 +232,13 @@ def _log_momentum_stats(pool, label):
 
 
 def _refresh_today_stocks_momentum(context):
-    """10:00 买入前刷新今日动量、MA20扣分并重新排序"""
+    """10:00 买入前刷新今日动量并重新排序"""
     for item in g.today_stocks:
-        final, y, t, dev, ma20_pen = _apply_momentum_score(
+        final, y, t = _apply_momentum_score(
             item['base_score'], item['code'], context, include_today=True)
         item['yesterday_mom'] = y
         item['today_mom'] = t
         item['momentum'] = y + t
-        item['ma20_dev'] = dev
-        item['ma20_penalty'] = ma20_pen
         item['score'] = final
     g.today_stocks.sort(key=lambda x: -x['score'])
 
@@ -273,7 +264,7 @@ def _check_stop_loss(context, market_score, label=''):
             _cleanup_position_state(stock)
 
 
-def _check_profit_trailing_all(context, label=''):
+def _check_profit_trailing_all(context, market_score, label=''):
     for stock in list(context.portfolio.positions.keys()):
         position = context.portfolio.positions[stock]
         if position.total_amount == 0:
@@ -286,13 +277,17 @@ def _check_profit_trailing_all(context, label=''):
             continue
         cost = position.avg_cost
         pnl_ratio = (current_price - cost) / cost
-        _apply_profit_trailing(stock, position, current_price, pnl_ratio, context)
+        _apply_profit_trailing(stock, position, current_price, pnl_ratio, context, market_score)
 
 
 def afternoon_stop_check(context):
     market_score = get_market_score(context)
     log.info(f"\n===== {context.current_dt.strftime('%Y-%m-%d')} ta3 14:30复检 =====")
-    _check_profit_trailing_all(context, label='14:30')
+    if market_score < g.trail_bear_score_threshold:
+        sh, sf = _get_trail_stop_levels(market_score)
+        log.info(f"⚠️ 大盘分{market_score:.0f}<{g.trail_bear_score_threshold}，"
+                 f"移动止损收紧×{g.trail_bear_tight_mult}：减半{sh*100:.1f}% 清仓{sf*100:.1f}%")
+    _check_profit_trailing_all(context, market_score, label='14:30')
     _check_stop_loss(context, market_score, label='14:30')
 
 
@@ -379,7 +374,7 @@ def before_trading_start(context):
             stage, score, setup = detect_cycle_stage(stock, context)
             # Stage2 + 特定形态
             if stage == 2 and setup in ['wedge_pop', 'ema_crossback', 'base_break']:
-                final_score, y_mom, t_mom, dev, ma20_pen = _apply_momentum_score(
+                final_score, y_mom, t_mom = _apply_momentum_score(
                     score, stock, context, include_today=False)
                 final_pool.append({
                     'code': stock,
@@ -389,8 +384,6 @@ def before_trading_start(context):
                     'yesterday_mom': y_mom,
                     'today_mom': t_mom,
                     'momentum': y_mom + t_mom,
-                    'ma20_dev': dev,
-                    'ma20_penalty': ma20_pen,
                     'score': final_score
                 })
         except Exception as e:
@@ -413,9 +406,8 @@ def before_trading_start(context):
         code_6 = item['code'].split('.')[0]
         code_list.append(code_6)
         log.info(f"{code_6}  {item['name']}  | 形态:{item['setup']}  "
-                 f"基础:{item['base_score']} MA20偏:{item['ma20_dev']:+.1f} "
-                 f"昨动量:{item['yesterday_mom']:+.1f} 今动量:{item['today_mom']:+.1f}  "
-                 f"总分:{item['score']:.1f}")
+                 f"基础:{item['base_score']} 昨动量:{item['yesterday_mom']:+.1f} "
+                 f"今动量:{item['today_mom']:+.1f}  总分:{item['score']:.1f}")
 
     if not final_pool:
         log.info("（无符合股票）")
@@ -477,6 +469,9 @@ def market_open_trade(context):
     market_score = get_market_score(context)
     position_ratio = calculate_position_ratio(market_score)
     log.info(f"大盘评分: {market_score:.0f} → 目标仓位: {position_ratio:.1%}")
+    if market_score < g.trail_bear_score_threshold:
+        sh, sf = _get_trail_stop_levels(market_score)
+        log.info(f"⚠️ 弱市移动止损收紧×{g.trail_bear_tight_mult}：减半{sh*100:.1f}% 清仓{sf*100:.1f}%")
 
     # 2. 卖出检查（先卖后买）
     sell_stocks = []
@@ -508,7 +503,7 @@ def market_open_trade(context):
             continue
 
         # 2.2 盈利回撤止盈（浮盈>50%：高点回撤8%减半，12%清仓）
-        if _apply_profit_trailing(stock, position, current_price, pnl_ratio, context):
+        if _apply_profit_trailing(stock, position, current_price, pnl_ratio, context, market_score):
             continue
 
         # 2.3 连续3天跌破上轨下沿
@@ -571,12 +566,11 @@ def market_open_trade(context):
     else:
         _refresh_today_stocks_momentum(context)
         _log_momentum_stats(g.today_stocks[:g.max_stock_output], '10:00')
-        log.info("📊 10:00重排后候选（动量±0.5分/%，MA20偏1%扣1分）:")
+        log.info("📊 10:00动量重排后候选（跌1%扣1分，涨1%加1分）:")
         for item in g.today_stocks[:g.max_stock_output]:
             log.info(f"  {item['code'].split('.')[0]} {item['name']} "
-                     f"基础{item['base_score']} MA20偏{item['ma20_dev']:+.1f} "
-                     f"昨{item['yesterday_mom']:+.1f} 今{item['today_mom']:+.1f} "
-                     f"总分{item['score']:.1f}")
+                     f"基础{item['base_score']} 昨{item['yesterday_mom']:+.1f} "
+                     f"今{item['today_mom']:+.1f} 总分{item['score']:.1f}")
 
         slots_available = g.max_holdings - current_count
 
@@ -639,8 +633,7 @@ def market_open_trade(context):
                     continue
 
                 log.info(f"🟢 买入 {stock}，总分：{item['score']:.1f}（基础{item['base_score']} "
-                         f"MA20偏{item['ma20_dev']:+.1f} 昨动量{item['yesterday_mom']:+.1f} "
-                         f"今动量{item['today_mom']:+.1f}），"
+                         f"昨动量{item['yesterday_mom']:+.1f} 今动量{item['today_mom']:+.1f}），"
                          f"形态：{item['setup']}，价格{current_price:.2f}，目标市值{target_value:.0f}")
 
                 # ← 使用安全下单（科创板限价保护）
