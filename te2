@@ -1,0 +1,1170 @@
+# 克隆自聚宽文章：https://www.joinquant.com/post/73678
+# 标题：感觉这策略还可以，大家再优化一下
+# 作者：金全人生
+
+# 克隆自聚宽文章：https://www.joinquant.com/post/73643
+# 标题：集思广益
+# 作者：liyiyyds
+
+# 克隆自聚宽文章：https://www.joinquant.com/post/73643
+# 标题：集思广益
+# 作者：liyiyyds
+
+# trade2 单点回撤优化系列 — 基于 trade2，每次只改一项，便于 A/B 回测
+# 基准逻辑与 trade2 相同：3只持仓、CANSLIM+价格行为、止损8%+通道3日+双死叉
+
+# te1 — 基于 trade2at4at5at4：盈利>50% 高点回撤减仓/清仓，max_holdings=5，含分析日志
+
+import talib
+import numpy as np
+import pandas as pd
+
+def initialize(context):
+    """初始化策略"""
+    # 设置基准
+    set_benchmark('000300.XSHG')
+    set_option('use_real_price', True)
+    set_order_cost(OrderCost(
+        open_tax=0,
+        close_tax=0.001,
+        open_commission=0.00025,
+        close_commission=0.00025,
+        close_today_commission=0,
+        min_commission=5
+    ), type='stock')
+    set_slippage(FixedSlippage(0.001))
+
+    # ==================== 仓位管理参数（来自趋势跟踪策略） ====================
+    g.max_holdings = 5                     # 最大持仓数量
+    g.position_size = 0.8                 # 基础仓位比例
+
+    # ==================== 选股参数（来自价格行为策略） ====================
+    g.max_correction_from_high = 0.30      # 允许从52周高点回撤不超过30%
+    g.enable_weekly_filter = False
+    g.min_price = 20.0
+    g.min_avg_money = 1e8
+    g.max_stock_output = 30
+    g.debug_mode = True
+
+    # ==================== 卖出参数 ====================
+    g.hard_stop = 0.08
+    g.hard_stop_tight = 0.06
+    g.hard_stop_score_threshold = 40
+    g.atr_stop_mult = 2.0
+
+    # ==================== trade2at4at5at4 盈利回撤止盈 ====================
+    g.trail_profit_threshold = 0.50    # 浮盈超过50%启用
+    g.trail_stop_half = 0.08           # 自高点回撤8% → 减仓50%
+    g.trail_stop_full = 0.12           # 自高点回撤12% → 清仓
+
+    # ==================== trade2at4at5 动量排序 ====================
+    g.momentum_factor_yesterday = 0.5    # 昨日涨跌幅权重：涨1%=+1分
+    g.momentum_factor_today = 0.5          # 今日涨跌幅权重：涨1%=+1分
+
+    # ==================== 状态变量 ====================
+    g.today_stocks = []                    # 当日精选股票列表
+    g.sold_today = set()                   # 当日已卖出的股票
+    g.buy_info = {}                        # 买入信息记录
+    g.daily_nav = []                       # 净值记录
+    g.break_upper_count = {}               # 记录每只股票跌破上轨下沿的天数
+    g.position_high = {}                   # 持仓最高价（盈利回撤止盈）
+    g.trail_half_done = {}                 # 是否已执行过半仓减仓
+
+    # ==================== 分析日志 ====================
+    g.strategy_tag = 'te1'
+    g.analysis_log = True                  # 结构化分析日志（巡检/漏斗/跟踪预警）
+    g._daily_sells = []                    # [(stock, reason, pnl_ratio)]
+    g._daily_buys = []                     # [(stock, score, setup)]
+
+    # ==================== 定时运行 ====================
+    run_daily(before_trading_start, time='07:30')
+    run_daily(market_open_trade, time='10:00')
+    run_daily(afternoon_stop_check, time='14:30')
+    run_daily(after_market_close, time='15:00')
+
+
+# ==================== 分析日志辅助 ====================
+
+def _stock_label(stock):
+    info = get_security_info(stock)
+    name = info.display_name if info else stock
+    return f"{name}({stock.split('.')[0]})"
+
+
+def _hold_days(stock, context):
+    info = g.buy_info.get(stock, {})
+    bd = info.get('buy_date')
+    if bd is None:
+        return -1
+    return (context.current_dt.date() - bd.date()).days
+
+
+def _log_trade(action, stock, context, reason, pnl_ratio=None, extra=''):
+    """统一交易流水，便于回测后按原因聚合"""
+    label = _stock_label(stock)
+    hold = _hold_days(stock, context)
+    info = g.buy_info.get(stock, {})
+    pnl_str = f"{pnl_ratio*100:+.1f}%" if pnl_ratio is not None else ""
+    log.info(f"[{action}] {label} {pnl_str} | 原因:{reason} | "
+             f"选入:{info.get('setup', '')} | 持仓{hold}天 | "
+             f"买入分{info.get('score', '')} | {extra}")
+    if action in ('SELL', 'HALF_SELL'):
+        g._daily_sells.append((stock, reason, pnl_ratio))
+    elif action == 'BUY':
+        g._daily_buys.append((stock, info.get('score', ''), info.get('setup', '')))
+
+
+def _explain_stop_threshold(stock, context, market_score):
+    hard = g.hard_stop
+    bear = market_score < g.hard_stop_score_threshold
+    after_bear = min(hard, g.hard_stop_tight) if bear else hard
+    atr_pct = _calc_atr_stop_pct(stock, context)
+    atr_part = g.atr_stop_mult * atr_pct if atr_pct is not None else None
+    threshold = after_bear
+    if atr_part is not None:
+        threshold = max(threshold, atr_part)
+    return threshold, {
+        'hard': hard, 'bear': bear, 'after_bear': after_bear,
+        'atr_pct': atr_pct, 'atr_part': atr_part, 'final': threshold
+    }
+
+
+def _log_stop_threshold(stock, context, market_score, label=''):
+    threshold, d = _explain_stop_threshold(stock, context, market_score)
+    atr_str = f"{d['atr_pct']*100:.1f}%" if d['atr_pct'] is not None else 'N/A'
+    atr_final = f"{d['atr_part']*100:.1f}%" if d['atr_part'] is not None else 'N/A'
+    log.info(f"[止损阈{label}] {_stock_label(stock)} hard={d['hard']:.0%} "
+             f"熊市={d['bear']} bear后={d['after_bear']:.0%} "
+             f"atr14={atr_str} 2xatr={atr_final} → 最终{-threshold*100:.1f}%")
+    return threshold
+
+
+def _log_position_inspect(stock, position, current_price, pnl_ratio, market_score, context, label='10:00'):
+    if not g.analysis_log:
+        return
+    threshold = _explain_stop_threshold(stock, context, market_score)[0]
+    peak = g.position_high.get(stock, current_price)
+    dd_peak = (current_price - peak) / peak if peak > 0 else 0
+    log.info(f"[巡检{label}] {_stock_label(stock)} 成本{position.avg_cost:.2f} "
+             f"现价{current_price:.2f} 浮盈{pnl_ratio*100:+.1f}% "
+             f"止损阈{-threshold*100:.1f}% 距止损{(pnl_ratio+threshold)*100:+.1f}% "
+             f"通道{g.break_upper_count.get(stock, 0)}天 "
+             f"高点{peak:.2f} 高点回撤{dd_peak*100:+.1f}% "
+             f"已减半{g.trail_half_done.get(stock, False)} 持仓{_hold_days(stock, context)}天")
+
+
+def _log_trail_status(stock, current_price, pnl_ratio, label=''):
+    if not g.analysis_log:
+        return
+    peak = g.position_high.get(stock, current_price)
+    if peak <= 0:
+        return
+    dd = (current_price - peak) / peak
+    half_done = g.trail_half_done.get(stock, False)
+    if pnl_ratio <= g.trail_profit_threshold:
+        if pnl_ratio >= g.trail_profit_threshold - 0.10:
+            log.info(f"[跟踪待机{label}] {_stock_label(stock)} 浮盈{pnl_ratio*100:+.1f}% "
+                     f"未达{g.trail_profit_threshold:.0%}门槛 高点{peak:.2f}")
+        return
+    if dd <= -g.trail_stop_full:
+        return  # 触发卖出，由 _log_trade 记录
+    if dd <= -g.trail_stop_half:
+        if half_done:
+            log.info(f"[跟踪跳过{label}] {_stock_label(stock)} 已减半 浮盈{pnl_ratio*100:+.1f}% "
+                     f"高点回撤{abs(dd*100):.1f}% 距清仓还差{(g.trail_stop_full-abs(dd))*100:.1f}%")
+        return
+    if dd <= -0.05:
+        log.info(f"[跟踪预警{label}] {_stock_label(stock)} 浮盈{pnl_ratio*100:+.1f}% "
+                 f"高点{peak:.2f} 回撤{abs(dd*100):.1f}% "
+                 f"距减半{(g.trail_stop_half-abs(dd))*100:.1f}% 距清仓{(g.trail_stop_full-abs(dd))*100:.1f}%")
+
+
+def _calc_atr_stop_pct(stock, context):
+    try:
+        hist = attribute_history(stock, 30, '1d', ['high', 'low', 'close'], skip_paused=True, df=False)
+        if len(hist['close']) < 15:
+            return None
+        atr = talib.ATR(hist['high'], hist['low'], hist['close'], timeperiod=14)[-1]
+        if not np.isfinite(atr) or hist['close'][-1] <= 0:
+            return None
+        return float(atr / hist['close'][-1])
+    except Exception:
+        return None
+
+
+def _get_stop_threshold(stock, context, market_score):
+    return _explain_stop_threshold(stock, context, market_score)[0]
+
+
+def _update_position_high(stock, price):
+    if price <= 0 or not np.isfinite(price):
+        return
+    prev = g.position_high.get(stock, price)
+    g.position_high[stock] = max(prev, price)
+
+
+def _cleanup_position_state(stock):
+    g.sold_today.add(stock)
+    g.buy_info.pop(stock, None)
+    g.break_upper_count.pop(stock, None)
+    g.position_high.pop(stock, None)
+    g.trail_half_done.pop(stock, None)
+
+
+def _check_profit_trailing(stock, current_price, pnl_ratio, label=''):
+    """浮盈>50%时：高点回撤8%减仓50%，回撤12%清仓。返回 'full' / 'half' / None"""
+    _update_position_high(stock, current_price)
+    _log_trail_status(stock, current_price, pnl_ratio, label)
+    if pnl_ratio <= g.trail_profit_threshold:
+        return None
+    peak = g.position_high.get(stock, current_price)
+    if peak <= 0:
+        return None
+    dd_from_peak = (current_price - peak) / peak
+    if dd_from_peak <= -g.trail_stop_full:
+        return 'full'
+    if dd_from_peak <= -g.trail_stop_half and not g.trail_half_done.get(stock, False):
+        return 'half'
+    return None
+
+
+def _apply_profit_trailing(stock, position, current_price, pnl_ratio, context, label=''):
+    peak = g.position_high.get(stock, current_price)
+    dd = (current_price - peak) / peak if peak > 0 else 0
+    action = _check_profit_trailing(stock, current_price, pnl_ratio, label)
+    if action == 'full':
+        _safe_order_target_value(stock, 0, current_price, 'sell', context)
+        _log_trade('SELL', stock, context, f'盈利回撤清仓-{abs(dd*100):.1f}%',
+                   pnl_ratio, f"高点{peak:.2f} 浮盈{pnl_ratio*100:+.1f}%")
+        _cleanup_position_state(stock)
+        return True
+    if action == 'half':
+        target_value = position.value * 0.5
+        _safe_order_target_value(stock, target_value, current_price, 'sell', context)
+        g.trail_half_done[stock] = True
+        _log_trade('HALF_SELL', stock, context, f'盈利回撤减半-{abs(dd*100):.1f}%',
+                   pnl_ratio, f"高点{peak:.2f} 目标市值{target_value:.0f}")
+        return True
+    return False
+
+
+def _get_pre_close(stock, context):
+    """获取昨收价（聚宽 current_data 无 pre_close 字段）"""
+    try:
+        hist = attribute_history(stock, 1, '1d', ['close'], skip_paused=True, df=False)
+        if len(hist['close']) >= 1:
+            pc = hist['close'][-1]
+            if np.isfinite(pc) and pc > 0:
+                return float(pc)
+    except Exception:
+        pass
+    return None
+
+
+def _get_yesterday_return_pct(stock, context):
+    """昨日涨跌幅（百分点），涨1%返回+1"""
+    try:
+        hist = attribute_history(stock, 2, '1d', ['close'], skip_paused=True, df=False)
+        if len(hist['close']) < 2 or hist['close'][-2] <= 0:
+            return 0.0
+        return float((hist['close'][-1] / hist['close'][-2] - 1) * 100)
+    except Exception:
+        return 0.0
+
+
+def _get_today_return_pct(stock, context):
+    """今日涨跌幅（百分点），涨1%返回+1；10:00用现价，盘前用开盘价"""
+    pre_close = _get_pre_close(stock, context)
+    if pre_close is None:
+        return 0.0
+    try:
+        cd = get_current_data()[stock]
+        price = cd.last_price
+        if not np.isfinite(price) or price <= 0:
+            price = cd.day_open
+        if np.isfinite(price) and price > 0:
+            return float((price - pre_close) / pre_close * 100)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _apply_momentum_score(base_score, stock, context, include_today=False):
+    """形态基础分 + 昨/今动量分（涨1%=+1，跌1%=-1）"""
+    y = _get_yesterday_return_pct(stock, context) * g.momentum_factor_yesterday
+    t = (_get_today_return_pct(stock, context) * g.momentum_factor_today
+         if include_today else 0.0)
+    return base_score + y + t, y, t
+
+
+def _log_momentum_stats(pool, label):
+    """汇总动量加减分：跌为负分，涨为正分"""
+    if not pool:
+        return
+    y_list = [item['yesterday_mom'] for item in pool]
+    t_list = [item['today_mom'] for item in pool]
+    m_list = [item['momentum'] for item in pool]
+    y_neg = sum(1 for v in y_list if v < 0)
+    t_neg = sum(1 for v in t_list if v < 0)
+    m_neg = sum(1 for v in m_list if v < 0)
+    log.info(f"📉 {label}动量统计: {len(pool)}只 | "
+             f"昨扣分{y_neg}只(均{y_list and sum(y_list)/len(y_list):+.2f}) "
+             f"今扣分{t_neg}只(均{t_list and sum(t_list)/len(t_list):+.2f}) | "
+             f"合计动量负分{m_neg}只 区间[{min(m_list):+.1f},{max(m_list):+.1f}]")
+
+
+def _refresh_today_stocks_momentum(context):
+    """10:00 买入前刷新今日动量并重新排序"""
+    for item in g.today_stocks:
+        final, y, t = _apply_momentum_score(
+            item['base_score'], item['code'], context, include_today=True)
+        item['yesterday_mom'] = y
+        item['today_mom'] = t
+        item['momentum'] = y + t
+        item['score'] = final
+    g.today_stocks.sort(key=lambda x: -x['score'])
+
+
+def _check_stop_loss(context, market_score, label=''):
+    for stock in list(context.portfolio.positions.keys()):
+        position = context.portfolio.positions[stock]
+        if position.total_amount == 0:
+            continue
+        current_data = get_current_data()
+        if current_data[stock].paused:
+            log.info(f"[止损跳过{label}] {_stock_label(stock)} 停牌")
+            continue
+        current_price = current_data[stock].last_price
+        if not np.isfinite(current_price) or current_price <= 0:
+            log.info(f"[止损跳过{label}] {_stock_label(stock)} 价格无效")
+            continue
+        cost = position.avg_cost
+        pnl_ratio = (current_price - cost) / cost
+        threshold, d = _explain_stop_threshold(stock, context, market_score)
+        if g.analysis_log:
+            _log_stop_threshold(stock, context, market_score, label)
+        if pnl_ratio <= -threshold:
+            reason = f"止损-{-threshold*100:.1f}%"
+            if d['atr_part'] is not None and threshold == d['atr_part']:
+                reason = f"ATR止损-{-threshold*100:.1f}%"
+            elif d['bear'] and threshold == d['after_bear']:
+                reason = f"熊市止损-{-threshold*100:.1f}%"
+            _safe_order_target_value(stock, 0, current_price, 'sell', context)
+            _log_trade('SELL', stock, context, reason, pnl_ratio,
+                       f"成本{cost:.2f} 现价{current_price:.2f}")
+            _cleanup_position_state(stock)
+
+
+def _check_profit_trailing_all(context, label=''):
+    for stock in list(context.portfolio.positions.keys()):
+        position = context.portfolio.positions[stock]
+        if position.total_amount == 0:
+            continue
+        current_data = get_current_data()
+        if current_data[stock].paused:
+            continue
+        current_price = current_data[stock].last_price
+        if not np.isfinite(current_price) or current_price <= 0:
+            continue
+        cost = position.avg_cost
+        pnl_ratio = (current_price - cost) / cost
+        _apply_profit_trailing(stock, position, current_price, pnl_ratio, context, label)
+
+
+def afternoon_stop_check(context):
+    market_score, mkt_detail = get_market_score(context, with_detail=True)
+    log.info(f"\n===== {context.current_dt.strftime('%Y-%m-%d')} {g.strategy_tag} 14:30复检 =====")
+    log.info(f"[大盘分] {mkt_detail['score']:.0f} 仓位{calculate_position_ratio(mkt_detail['score']):.0%} | "
+             f"close={mkt_detail['close']:.2f} ma20={mkt_detail['ma20']:.2f} "
+             f"ma60={mkt_detail['ma60']:.2f} ret20={mkt_detail['ret20']*100:+.1f}%")
+    _check_profit_trailing_all(context, label='14:30')
+    _check_stop_loss(context, market_score, label='14:30')
+
+
+def _is_st_or_delist(stock, current_data=None):
+    """排除 ST / *ST / 退市风险股（is_st 标志 + 名称）"""
+    if current_data is None:
+        current_data = get_current_data()
+    cd = current_data[stock]
+    if cd.is_st:
+        return True
+    info = get_security_info(stock)
+    if info is None:
+        return True
+    name = (info.display_name or '') + (getattr(cd, 'name', '') or '')
+    for kw in ('ST', '※ST', '*ST', '退'):
+        if kw in name:
+            return True
+    return False
+
+def get_market_score(context, with_detail=False):
+    """
+    大盘趋势评分（来自趋势跟踪策略）
+    返回0-100分，用于仓位管理
+    """
+    df = get_price('000001.XSHG', count=60, end_date=context.previous_date, fields='close')
+    if len(df) < 60:
+        detail = {'score': 50, 'close': 0, 'ma20': 0, 'ma60': 0, 'ret20': 0, 'base': 50}
+        return (50, detail) if with_detail else 50
+
+    close = df['close']
+    ma20 = close.rolling(20).mean().iloc[-1]
+    ma60 = close.rolling(60).mean().iloc[-1]
+    current = close.iloc[-1]
+
+    if current > ma20 > ma60:
+        base_score = 80
+    elif current > ma20:
+        base_score = 60
+    elif current > ma60:
+        base_score = 40
+    else:
+        base_score = 30
+
+    ret20 = (current / close.iloc[-21] - 1) if len(close) >= 21 else 0
+    score = base_score
+    if ret20 > 0.05:
+        score = min(90, score + 10)
+    elif ret20 < -0.05:
+        score = max(20, score - 10)
+
+    detail = {
+        'score': score, 'close': current, 'ma20': ma20, 'ma60': ma60,
+        'ret20': ret20, 'base': base_score
+    }
+    return (score, detail) if with_detail else score
+
+def calculate_position_ratio(market_score):
+    """
+    根据大盘评分计算仓位比例
+    """
+    if market_score >= 70:
+        return 1.0   # 满仓
+    elif market_score >= 55:
+        return 0.8   # 8成仓
+    elif market_score >= 40:
+        return 0.6   # 6成仓
+    elif market_score >= 25:
+        return 0.4   # 4成仓
+    else:
+        return 0.2   # 2成仓
+
+def before_trading_start(context):
+    """盘前选股，计算持仓股票的死叉信号"""
+    g._daily_sells = []
+    g._daily_buys = []
+
+    log.info("=" * 60)
+    log.info(f"📊 价格行为选股执行中 · {g.strategy_tag}")
+    log.info("=" * 60)
+
+    g.sold_today.clear()
+
+    stock_pool, stats = get_canslim_pool(context)
+    log.info(f"📈 选股漏斗: 基本面{stats['fundamental']} → 合规{stats['filtered_exclude']} → "
+             f"技术面{stats['technical_pass']} "
+             f"(52周回撤剔除{stats.get('corr_excluded', 0)} "
+             f"MA200剔除{stats.get('ma200_excluded', 0)} "
+             f"低价剔除{stats.get('price_excluded', 0)} "
+             f"成交额剔除{stats.get('volume_excluded', 0)} "
+             f"历史不足{stats.get('hist_short', 0)})")
+
+    final_pool = []
+    stage_reject = 0
+    stage_errors = 0
+    for stock in stock_pool:
+        try:
+            stage, score, setup = detect_cycle_stage(stock, context)
+            if stage == 2 and setup in ['wedge_pop', 'ema_crossback', 'base_break']:
+                final_score, y_mom, t_mom = _apply_momentum_score(
+                    score, stock, context, include_today=False)
+                final_pool.append({
+                    'code': stock,
+                    'name': get_security_info(stock).display_name,
+                    'base_score': score,
+                    'setup': setup,
+                    'yesterday_mom': y_mom,
+                    'today_mom': t_mom,
+                    'momentum': y_mom + t_mom,
+                    'score': final_score
+                })
+            else:
+                stage_reject += 1
+        except Exception as e:
+            stage_errors += 1
+            if g.debug_mode:
+                log.warn(f"处理 {stock} 时出错: {e}")
+            continue
+
+    log.info(f"📊 Stage2形态: 技术面{len(stock_pool)} → 通过{len(final_pool)} "
+             f"(形态不符/非Stage2: {stage_reject} 异常: {stage_errors})")
+    _log_momentum_stats(final_pool, '07:30')
+    final_pool.sort(key=lambda x: -x['score'])
+    final_pool = final_pool[:g.max_stock_output]
+    g.today_stocks = final_pool[:]
+
+    # 输出自选股清单
+    log.info("")
+    log.info("✅ 今日精选自选股（按质量排序）")
+    log.info("-" * 60)
+    code_list = []
+    for item in final_pool:
+        code_6 = item['code'].split('.')[0]
+        code_list.append(code_6)
+        log.info(f"{code_6}  {item['name']}  | 形态:{item['setup']}  "
+                 f"基础:{item['base_score']} 昨动量:{item['yesterday_mom']:+.1f} "
+                 f"今动量:{item['today_mom']:+.1f}  总分:{item['score']:.1f}")
+
+    if not final_pool:
+        log.info("（无符合股票）")
+    log.info("-" * 60)
+    log.info(f"📋 共 {len(final_pool)} 只候选股票")
+
+    if not final_pool:
+        log.info("⚠️ 今日无符合所有条件的股票，建议空仓观望。")
+
+    log.info("=" * 60)
+
+def calc_dktd_channel(stock, context):
+    """
+    计算多空通道指标 - 上轨下沿（趋势1）
+    返回: 趋势1_上轨下沿，计算失败返回None
+    """
+    try:
+        current_date = context.current_dt.date()
+        # 用get_price明确获取历史数据
+        df = get_price(stock, end_date=current_date, frequency='1d',
+                      fields=['close', 'volume'], skip_paused=False, count=250)
+        if len(df) < 50:
+            return None
+
+        close = df['close'].values
+        vol = df['volume'].values
+
+        # CTA1 = CLOSE * VOL
+        cta1 = close * vol
+
+        # EXPMA(CTA1, N) / EXPMA(VOL, N) = 加权平均价
+        def expma(arr, n):
+            return pd.Series(arr).ewm(span=n, adjust=False).mean().values
+
+        # CTA2 = EMA((加权平均价3+6+12+24)/4, 13)
+        wp3 = expma(cta1, 3) / expma(vol, 3)
+        wp6 = expma(cta1, 6) / expma(vol, 6)
+        wp12 = expma(cta1, 12) / expma(vol, 12)
+        wp24 = expma(cta1, 24) / expma(vol, 24)
+        cta2_raw = (wp3 + wp6 + wp12 + wp24) / 4.0
+        cta2 = pd.Series(cta2_raw).ewm(span=13, adjust=False).mean().iloc[-1]
+
+        # 趋势1 = CTA2 * 1.01 (上轨下沿)
+        trend1 = cta2 * 1.01
+
+        return trend1
+
+    except Exception as e:
+        if g.debug_mode:
+            log.warn(f"计算多空通道 {stock} 出错: {e}")
+        return None
+
+def market_open_trade(context):
+    """10:00统一交易：卖出 + 买入"""
+    current_date = context.current_dt.strftime('%Y-%m-%d')
+    log.info(f"\n===== {current_date} {g.strategy_tag} 交易 =====")
+
+    market_score, mkt_detail = get_market_score(context, with_detail=True)
+    position_ratio = calculate_position_ratio(market_score)
+    log.info(f"[大盘分] {market_score:.0f} → 目标仓位{position_ratio:.0%} | "
+             f"上证close={mkt_detail['close']:.2f} ma20={mkt_detail['ma20']:.2f} "
+             f"ma60={mkt_detail['ma60']:.2f} ret20={mkt_detail['ret20']*100:+.1f}% "
+             f"基础分{mkt_detail['base']}")
+
+    sell_stocks = []
+    half_sell_stocks = []
+    for stock in list(context.portfolio.positions.keys()):
+        position = context.portfolio.positions[stock]
+        if position.total_amount == 0:
+            continue
+
+        current_data = get_current_data()
+        if current_data[stock].paused:
+            log.info(f"[卖出跳过] {_stock_label(stock)} 停牌")
+            continue
+
+        current_price = current_data[stock].last_price
+        if not np.isfinite(current_price) or current_price <= 0:
+            log.info(f"[卖出跳过] {_stock_label(stock)} 价格无效")
+            continue
+
+        cost = position.avg_cost
+        pnl_ratio = (current_price - cost) / cost
+        _log_position_inspect(stock, position, current_price, pnl_ratio, market_score, context, '10:00')
+
+        stop_threshold = _get_stop_threshold(stock, context, market_score)
+        if pnl_ratio <= -stop_threshold:
+            _, d = _explain_stop_threshold(stock, context, market_score)
+            reason = f"止损-{-stop_threshold*100:.1f}%"
+            if d['atr_part'] is not None and stop_threshold == d['atr_part']:
+                reason = f"ATR止损-{-stop_threshold*100:.1f}%"
+            _safe_order_target_value(stock, 0, current_price, 'sell', context)
+            _log_trade('SELL', stock, context, reason, pnl_ratio,
+                       f"成本{cost:.2f} 现价{current_price:.2f}")
+            sell_stocks.append(stock)
+            _cleanup_position_state(stock)
+            continue
+
+        if _apply_profit_trailing(stock, position, current_price, pnl_ratio, context, '10:00'):
+            if stock in g.trail_half_done and stock in context.portfolio.positions:
+                if context.portfolio.positions[stock].total_amount > 0:
+                    half_sell_stocks.append(stock)
+                    continue
+            sell_stocks.append(stock)
+            continue
+
+        ch_cnt = g.break_upper_count.get(stock, 0)
+        if ch_cnt >= 3:
+            _safe_order_target_value(stock, 0, current_price, 'sell', context)
+            _log_trade('SELL', stock, context, '连续3日跌破通道', pnl_ratio,
+                       f"通道计数{ch_cnt}天")
+            sell_stocks.append(stock)
+            _cleanup_position_state(stock)
+            continue
+        elif ch_cnt > 0 and g.analysis_log:
+            log.info(f"[通道预警] {_stock_label(stock)} 计数{ch_cnt}天 浮盈{pnl_ratio*100:+.1f}%")
+
+        try:
+            hist = attribute_history(stock, 250, '1d', ['close'], skip_paused=True, df=False)
+            if len(hist['close']) >= 50:
+                close = hist['close']
+
+                ma6 = talib.SMA(close, timeperiod=6)
+                ma12 = talib.SMA(close, timeperiod=12)
+                ma24 = talib.SMA(close, timeperiod=24)
+                ma48 = talib.SMA(close, timeperiod=48)
+                bbi = (ma6 + ma12 + ma24 + ma48) / 4.0
+
+                y_close = close[-1]
+                y_bbi = bbi[-1]
+                py_close = close[-2]
+                py_bbi = bbi[-2]
+                bbi_dead = (y_close < y_bbi) and (py_close >= py_bbi)
+
+                macd, signal, hist_macd = talib.MACD(close, fastperiod=5, slowperiod=10, signalperiod=15)
+                y_macd = macd[-1]
+                y_signal = signal[-1]
+                py_macd = macd[-2]
+                py_signal = signal[-2]
+                macd_dead = (y_macd < y_signal) and (py_macd >= py_signal)
+
+                if bbi_dead and macd_dead:
+                    _safe_order_target_value(stock, 0, current_price, 'sell', context)
+                    _log_trade('SELL', stock, context, 'BBI+MACD双死叉', pnl_ratio,
+                               f"现价{current_price:.2f}")
+                    sell_stocks.append(stock)
+                    _cleanup_position_state(stock)
+                elif g.analysis_log and (bbi_dead or macd_dead):
+                    which = 'BBI死叉' if bbi_dead else 'MACD死叉'
+                    log.info(f"[死叉半触发] {_stock_label(stock)} 仅{which} 浮盈{pnl_ratio*100:+.1f}%")
+        except Exception as e:
+            if g.debug_mode:
+                log.warn(f"计算死叉信号 {stock} 出错: {e}")
+
+    log.info(f"[10:00卖出汇总] 清仓{len(sell_stocks)}只{sell_stocks} 减半{len(half_sell_stocks)}只{half_sell_stocks}")
+    current_holdings = [s for s in context.portfolio.positions.keys()
+                       if context.portfolio.positions[s].total_amount > 0]
+    current_count = len(current_holdings)
+
+    # 4. 买入检查
+    if not g.today_stocks:
+        log.info("今日无候选股票，跳过买入")
+    elif current_count >= g.max_holdings:
+        log.info(f"当前已满仓{current_count}支，不再买入")
+    elif market_score < 30:
+        log.info(f"大盘评分{market_score:.0f}低于30，暂停买入")
+    else:
+        pre_rank = {item['code']: (i + 1, item['score'])
+                    for i, item in enumerate(g.today_stocks[:g.max_stock_output])}
+        _refresh_today_stocks_momentum(context)
+        if g.analysis_log:
+            for i, item in enumerate(g.today_stocks[:min(10, len(g.today_stocks))]):
+                code = item['code']
+                if code not in pre_rank:
+                    continue
+                old_r, old_s = pre_rank[code]
+                new_r = i + 1
+                if old_r != new_r or abs(old_s - item['score']) > 0.01:
+                    log.info(f"[排名变化] {code.split('.')[0]} {item['name']} "
+                             f"排名{old_r}→{new_r} 分{old_s:.1f}→{item['score']:.1f} "
+                             f"今动量{item['today_mom']:+.1f}")
+        _log_momentum_stats(g.today_stocks[:g.max_stock_output], '10:00')
+        log.info("📊 10:00动量重排后候选（跌1%扣1分，涨1%加1分）:")
+        for item in g.today_stocks[:g.max_stock_output]:
+            log.info(f"  {item['code'].split('.')[0]} {item['name']} "
+                     f"基础{item['base_score']} 昨{item['yesterday_mom']:+.1f} "
+                     f"今{item['today_mom']:+.1f} 总分{item['score']:.1f}")
+
+        slots_available = g.max_holdings - current_count
+        total_value = context.portfolio.total_value
+        target_total_value = total_value * position_ratio
+        per_stock_target = target_total_value / g.max_holdings
+        stock_exposure = sum(
+            context.portfolio.positions[s].value
+            for s in current_holdings
+        )
+        log.info(f"[仓位预算] 总资产{total_value:.0f} 目标暴露{position_ratio:.0%}="
+                 f"{target_total_value:.0f} 当前股票市值{stock_exposure:.0f}"
+                 f"({stock_exposure/total_value:.0%}) 单票目标{per_stock_target:.0f} "
+                 f"持仓{current_count}/{g.max_holdings} 空槽{slots_available} "
+                 f"可用现金{context.portfolio.available_cash:.0f}")
+
+        candidates = []
+        for item in g.today_stocks[:g.max_stock_output]:
+            stock = item['code']
+            if stock in current_holdings:
+                log.info(f"{stock} 已持仓，跳过")
+                continue
+            if stock in g.sold_today:
+                log.info(f"{stock} 今日已被卖出，当天不再买入")
+                continue
+
+            current_data = get_current_data()
+            if current_data[stock].paused:
+                log.info(f"{stock} 停牌，跳过")
+                continue
+
+            # ← 先获取current_price
+            current_price = current_data[stock].last_price
+            if not np.isfinite(current_price) or current_price <= 0:
+                log.info(f"[买入跳过] {_stock_label(stock)} 价格无效")
+                continue
+
+            code_pure = stock.split('.')[0]
+            if _is_st_or_delist(stock, current_data):
+                log.info(f"{stock} ST/*ST/退市股，跳过")
+                continue
+            if code_pure.startswith(('8','9','43','83','87')):
+                log.info(f"{stock} 北交所/新三板，跳过")
+                continue
+            if current_price >= current_data[stock].high_limit * 0.998:
+                log.info(f"{stock} 涨停或接近涨停，跳过")
+                continue
+
+            candidates.append(item)
+            if len(candidates) >= slots_available:
+                break
+
+        if not candidates:
+            log.info("没有可买入的新股票")
+        else:
+            log.info(f"[买入候选] {len(candidates)}只: "
+                     f"{[c['code'].split('.')[0] for c in candidates]}")
+            available_cash = context.portfolio.available_cash
+            for item in candidates:
+                stock = item['code']
+                current_price = get_current_data()[stock].last_price
+                if not np.isfinite(current_price) or current_price <= 0:
+                    log.info(f"[买入跳过] {_stock_label(stock)} 价格无效")
+                    continue
+
+                target_value = min(per_stock_target, available_cash)
+                if target_value < 5000:
+                    log.info(f"[买入跳过] {_stock_label(stock)} 资金不足 需{per_stock_target:.0f} 可用{available_cash:.0f}")
+                    continue
+
+                _safe_order_target_value(stock, target_value, current_price, 'buy', context)
+
+                g.buy_info[stock] = {
+                    'buy_price': current_price,
+                    'buy_date': context.current_dt,
+                    'setup': item['setup'],
+                    'score': item['score']
+                }
+                g.position_high[stock] = current_price
+                g.trail_half_done.pop(stock, None)
+
+                _log_trade('BUY', stock, context, '新开仓', None,
+                           f"总分{item['score']:.1f} 基础{item['base_score']} "
+                           f"昨动量{item['yesterday_mom']:+.1f} 今动量{item['today_mom']:+.1f} "
+                           f"形态{item['setup']} 价{current_price:.2f} 目标市值{target_value:.0f}")
+
+                available_cash -= target_value
+
+    # 5. 输出当前持仓
+    positions = context.portfolio.positions
+    holdings = [(s, pos.total_amount, pos.avg_cost)
+                for s, pos in positions.items() if pos.total_amount > 0]
+
+    if holdings:
+        log.info(f"\n[持仓快照] {len(holdings)}只:")
+        total_value = 0
+        port_total = context.portfolio.total_value
+        for stock, amount, cost in holdings:
+            current = get_current_data()[stock].last_price
+            profit = (current - cost) / cost
+            position_value = amount * current
+            total_value += position_value
+            info = g.buy_info.get(stock, {})
+            peak = g.position_high.get(stock, current)
+            dd_peak = (current - peak) / peak if peak > 0 else 0
+            log.info(f"  {_stock_label(stock)} 成本{cost:.2f} 现价{current:.2f} "
+                     f"市值{position_value:.0f}({position_value/port_total:.0%}) "
+                     f"浮盈{profit*100:+.1f}% 持仓{_hold_days(stock, context)}天 "
+                     f"形态{info.get('setup', '')} 通道{g.break_upper_count.get(stock, 0)}天 "
+                     f"高点{peak:.2f} 高点回撤{dd_peak*100:+.1f}% "
+                     f"已减半{g.trail_half_done.get(stock, False)}")
+        cash = context.portfolio.available_cash
+        log.info(f"[暴露度] 股票{total_value:.0f}({total_value/port_total:.0%}) "
+                 f"现金{cash:.0f}({cash/port_total:.0%}) 合计{port_total:.0f}")
+    else:
+        log.info("当前空仓")
+
+    # 6. 清空今日选股池
+    g.today_stocks = []
+
+# ← 新增：安全下单函数（科创板限价保护）
+def _safe_order_target_value(stock, target_value, current_price, side, context):
+    """
+    安全下单：科创板使用限价保护，其他正常下单
+    side: 'buy' 或 'sell'
+    """
+    code_pure = stock.split('.')[0]
+
+    if code_pure.startswith('688'):
+        # 科创板必须限价，价格笼子±2%
+        if side == 'buy':
+            limit_price = min(current_price * 1.02, current_price + 0.01)
+            order_target_value(stock, target_value, style=LimitOrderStyle(limit_price))
+            log.info(f"  [科创板限价买入] {stock} 限价{limit_price:.2f}")
+        else:
+            limit_price = max(current_price * 0.98, current_price - 0.01)
+            order_target_value(stock, 0, style=LimitOrderStyle(limit_price))
+            log.info(f"  [科创板限价卖出] {stock} 限价{limit_price:.2f}")
+    else:
+        order_target_value(stock, target_value)
+
+def after_market_close(context):
+    """盘后统计 + 更新通道跌破计数"""
+
+    current_date = context.current_dt.date()
+    log.info(f"📊 after_market_close 执行，日期: {current_date}")
+
+    # ← 更新连续收盘跌破上轨下沿计数
+    for stock in list(context.portfolio.positions.keys()):
+        position = context.portfolio.positions[stock]
+        if position.total_amount == 0:
+            continue
+
+        try:
+            df_today = get_price(stock, end_date=current_date, frequency='1d',
+                                 fields=['close'], skip_paused=False, count=1)
+            if len(df_today) > 0:
+                close_today = float(df_today['close'].iloc[-1])
+                old_peak = g.position_high.get(stock, close_today)
+                _update_position_high(stock, close_today)
+                new_peak = g.position_high.get(stock, close_today)
+                if g.analysis_log and new_peak > old_peak:
+                    log.info(f"[高点更新] {_stock_label(stock)} {old_peak:.2f}→{new_peak:.2f} "
+                             f"收盘{close_today:.2f}")
+        except Exception:
+            pass
+
+        trend1 = calc_dktd_channel(stock, context)
+        if trend1 is not None:
+            try:
+                df_today = get_price(stock, end_date=current_date, frequency='1d',
+                                     fields=['close'], skip_paused=False, count=1)
+                if len(df_today) > 0:
+                    today_close = df_today['close'].iloc[-1]
+                    if today_close < trend1:
+                        g.break_upper_count[stock] = g.break_upper_count.get(stock, 0) + 1
+                        cnt = g.break_upper_count[stock]
+                        tag = '[通道预警]' if cnt < 3 else '[通道计数]'
+                        log.info(f"{tag} {_stock_label(stock)} 上轨下沿{trend1:.2f} "
+                                 f"收盘{today_close:.2f} 连续{cnt}天")
+                    else:
+                        if stock in g.break_upper_count:
+                            old_cnt = g.break_upper_count[stock]
+                            del g.break_upper_count[stock]
+                            log.info(f"[通道恢复] {_stock_label(stock)} 收盘{today_close:.2f} "
+                                     f">=上轨{trend1:.2f} 计数{old_cnt}→0")
+                else:
+                    log.warn(f"📊 {stock} 获取当天收盘价失败")
+            except Exception as e:
+                log.warn(f"📊 {stock} 获取收盘价出错: {e}")
+                if stock in g.break_upper_count:
+                    del g.break_upper_count[stock]
+        else:
+            if stock in g.break_upper_count:
+                del g.break_upper_count[stock]
+
+    # 盘后统计（原代码不变）
+    portfolio_value = context.portfolio.total_value
+    start_cash = context.portfolio.starting_cash
+    total_return = (portfolio_value - start_cash) / start_cash
+
+    g.daily_nav.append({
+        'date': context.current_dt,
+        'portfolio': portfolio_value,
+        'return': total_return
+    })
+
+    if len(g.daily_nav) > 1:
+        nav_series = pd.Series([n['portfolio'] for n in g.daily_nav])
+        rolling_max = nav_series.expanding().max()
+        drawdown = (nav_series - rolling_max) / rolling_max
+        max_drawdown = drawdown.min()
+    else:
+        max_drawdown = 0
+
+    log.info(f"\n========== 盘后统计 ==========")
+    log.info(f"日期: {context.current_dt.strftime('%Y-%m-%d')}")
+    log.info(f"策略净值: {portfolio_value:.2f}")
+    log.info(f"策略累计收益: {total_return:.2%}")
+    log.info(f"当前最大回撤: {max_drawdown:.2%}")
+
+    holdings = [s for s, p in context.portfolio.positions.items() if p.total_amount > 0]
+    stock_val = sum(context.portfolio.positions[s].value for s in holdings)
+    cash = context.portfolio.available_cash
+    if portfolio_value > 0:
+        log.info(f"[日终] 持仓{len(holdings)}只 股票暴露{stock_val/portfolio_value:.1%} "
+                 f"现金{cash/portfolio_value:.1%} 当日买{len(g._daily_buys)}笔 卖{len(g._daily_sells)}笔")
+    if g._daily_sells:
+        for stock, reason, pnl in g._daily_sells:
+            pnl_s = f"{pnl*100:+.1f}%" if pnl is not None else ""
+            log.info(f"  卖 {_stock_label(stock)} {pnl_s} {reason}")
+    if g._daily_buys:
+        for stock, score, setup in g._daily_buys:
+            log.info(f"  买 {_stock_label(stock)} 分{score} 形态{setup}")
+    log.info(f"================================\n")
+# ==================== 价格行为选股辅助函数 ====================
+
+def detect_cycle_stage(stock, context):
+    """检测股票所处的周期阶段（Stage1-4）"""
+    hist = attribute_history(stock, 250, '1d', ['close', 'high', 'low', 'volume'], skip_paused=True, df=False)
+    if len(hist['close']) < 200:
+        return 0, 0, 'none'
+
+    close = hist['close']
+    high = hist['high']
+    low = hist['low']
+    volume = hist['volume']
+
+    ema10 = talib.EMA(close, timeperiod=10)
+    ema20 = talib.EMA(close, timeperiod=20)
+    ma200 = talib.SMA(close, timeperiod=200)
+    vol_ma20 = talib.SMA(volume, timeperiod=20)
+
+    c = close[-1]
+    e10 = ema10[-1]
+    e20 = ema20[-1]
+    m200 = ma200[-1] if len(ma200) > 0 and not np.isnan(ma200[-1]) else 0
+    v = volume[-1]
+    v20 = vol_ma20[-1] if not np.isnan(vol_ma20[-1]) else 0
+
+    # Stage2检测：价格在200日均线上方
+    if m200 > 0 and c < m200 * 0.95:
+        return 0, 0, 'none'
+
+    if g.enable_weekly_filter:
+        if not _weekly_trend_ok(stock, context):
+            return 0, 0, 'none'
+
+    # 楔形突破
+    wedge_ok, _ = _detect_wedge_pop(close, high, low, ema10, ema20, volume, v20)
+    if wedge_ok and c > e10 > e20 and e10 > ema10[-5]:
+        if v > v20 * 1.5:
+            return 2, 100, 'wedge_pop'
+
+    # EMA回踩
+    crossback_ok, _ = _detect_ema_crossback(close, high, low, ema10, ema20, volume, v20)
+    if crossback_ok and e10 > e20 and e10 > ema10[-5]:
+        return 2, 85, 'ema_crossback'
+
+    # 基底突破
+    base_ok, _ = _detect_base_break(close, high, low, ema10, ema20, volume, v20)
+    if base_ok and c > e10 > e20:
+        if v > v20 * 1.3:
+            return 2, 80, 'base_break'
+
+    return 0, 0, 'none'
+
+def _weekly_trend_ok(stock, context):
+    """周线趋势确认"""
+    try:
+        w = get_price(stock, count=30, frequency='1w', fields=['close'], skip_paused=True)['close']
+        if len(w) < 15:
+            return False
+        w_ema10 = talib.EMA(w, timeperiod=10)
+        w_ema20 = talib.EMA(w, timeperiod=20)
+        return w_ema10[-1] > w_ema20[-1] and w[-1] > w_ema10[-1] * 0.98
+    except:
+        return False
+
+def _detect_wedge_pop(close, high, low, ema10, ema20, volume, v20):
+    """检测楔形突破形态"""
+    if len(close) < 20:
+        return False, 0
+    highs = high[-15:]
+    local_highs = []
+    for i in range(1, len(highs)-1):
+        if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+            local_highs.append(highs[i])
+    if len(local_highs) < 3:
+        return False, 0
+    decreasing = all(local_highs[i] > local_highs[i+1] for i in range(len(local_highs)-1))
+    if not decreasing:
+        return False, 0
+    if close[-1] <= np.max(high[-3:]):
+        return False, 0
+    if ema10[-1] <= ema20[-1] or ema10[-1] <= ema10[-3]:
+        return False, 0
+    return True, 90
+
+def _detect_ema_crossback(close, high, low, ema10, ema20, volume, v20):
+    """检测EMA回踩形态"""
+    if len(close) < 12:
+        return False, 0
+    touched_ema = False
+    for i in range(-10, -1):
+        if close[i] <= ema10[i] * 1.01:
+            touched_ema = True
+            break
+    if not touched_ema:
+        return False, 0
+    if close[-1] < ema10[-1] * 0.995:
+        return False, 0
+    if ema10[-1] <= ema20[-1] or ema10[-1] <= ema10[-3]:
+        return False, 0
+    return True, 80
+
+def _detect_base_break(close, high, low, ema10, ema20, volume, v20):
+    """检测基底突破形态"""
+    if len(close) < 25:
+        return False, 0
+    base_high = high[-20:-5]
+    base_low = low[-20:-5]
+    base_range = (np.max(base_high) - np.min(base_low)) / np.min(base_low)
+    if base_range > 0.08:
+        return False, 0
+    if close[-1] <= np.max(base_high):
+        return False, 0
+    if ema10[-1] <= ema20[-1]:
+        return False, 0
+    return True, 85
+
+def get_canslim_pool(context):
+    """CANSLIM基本面 + 技术面选股"""
+    q = query(
+        valuation.code,
+        valuation.circulating_market_cap,
+        indicator.inc_net_profit_year_on_year,
+        indicator.inc_total_revenue_year_on_year,
+        indicator.roe,
+        indicator.eps
+    ).filter(
+        valuation.circulating_market_cap > 20,
+        valuation.circulating_market_cap < 500,
+        indicator.inc_net_profit_year_on_year > 30,
+        indicator.inc_total_revenue_year_on_year > 30,
+        indicator.roe > 8,
+        indicator.eps > 0
+    ).order_by(
+        indicator.inc_net_profit_year_on_year.desc()
+    ).limit(150)
+
+    try:
+        df = get_fundamentals(q, date=context.previous_date)
+        if df.empty:
+            df = get_fundamentals(q, date=context.previous_date - pd.Timedelta(days=1))
+    except:
+        df = pd.DataFrame()
+
+    stocks = list(df['code']) if not df.empty else []
+    fundamental_cnt = len(stocks)
+
+    if g.debug_mode and fundamental_cnt > 0:
+        log.info(f"🔍 基本面初筛: {fundamental_cnt} 只")
+
+    today_date = context.current_dt.date()
+    current_data = get_current_data()  # ← 新增：获取当前数据用于ST判断
+
+    filtered = []
+    for s in stocks:
+        code_pure = s.split('.')[0]
+
+        if _is_st_or_delist(s, current_data):
+            continue
+
+        # 排除指数
+        if code_pure.startswith('399'):
+            continue
+
+        # ← 新增：排除北交所/新三板
+        if code_pure.startswith(('8','9','43','83','87')):
+            continue
+
+        # 排除上市不足120天的次新股
+        info = get_security_info(s)
+        if info is None or info.type != 'stock':
+            continue
+        if (today_date - info.start_date).days < 120:
+            continue
+
+        filtered.append(s)
+
+    filtered_cnt = len(filtered)
+    if g.debug_mode:
+        log.info(f"🔍 ST/北交所过滤后: {filtered_cnt} 只")
+
+    result = []
+    hist_short = corr_excluded = ma200_excluded = 0
+    price_excluded = volume_excluded = 0
+    for s in filtered:
+        try:
+            hist = attribute_history(s, 250, '1d', ['high', 'close', 'volume'], skip_paused=True, df=False)
+            if len(hist['close']) < 200:
+                hist_short += 1
+                continue
+
+            high_52w = np.nanmax(hist['high'])
+            current_price = hist['close'][-1]
+
+            if current_price < high_52w * (1 - g.max_correction_from_high):
+                corr_excluded += 1
+                continue
+
+            ma200 = talib.SMA(hist['close'], timeperiod=200)
+            if len(ma200) == 0 or np.isnan(ma200[-1]):
+                ma200_excluded += 1
+                continue
+            if current_price < ma200[-1] * 0.95:
+                ma200_excluded += 1
+                continue
+
+            if current_price < g.min_price:
+                price_excluded += 1
+                continue
+            avg_money = np.mean(hist['close'][-20:] * hist['volume'][-20:])
+            if avg_money < g.min_avg_money:
+                volume_excluded += 1
+                continue
+
+            result.append(s)
+        except Exception as e:
+            if g.debug_mode:
+                log.warn(f"技术面过滤 {s} 出错: {e}")
+            continue
+
+    stats = {
+        'fundamental': fundamental_cnt,
+        'filtered_exclude': filtered_cnt,
+        'technical_pass': len(result),
+        'hist_short': hist_short,
+        'corr_excluded': corr_excluded,
+        'ma200_excluded': ma200_excluded,
+        'price_excluded': price_excluded,
+        'volume_excluded': volume_excluded,
+    }
+    return result, stats
+
+def handle_data(context, data):
+    pass
