@@ -35,7 +35,7 @@ def initialize(context):
     set_slippage(FixedSlippage(0.001))
 
     # ==================== 仓位管理参数（来自趋势跟踪策略） ====================
-    g.max_holdings = 7                     # 最大持仓数量
+    g.max_holdings = 5                     # 最大持仓数量
     g.position_size = 0.8                 # 基础仓位比例
 
     # ==================== 选股参数（来自价格行为策略） ====================
