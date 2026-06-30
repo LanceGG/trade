@@ -35,7 +35,7 @@ def initialize(context):
     set_slippage(FixedSlippage(0.001))
 
     # ==================== 仓位管理参数（来自趋势跟踪策略） ====================
-    g.max_holdings = 5                     # 最大持仓数量
+    g.max_holdings = 3                     # 最大持仓数量
     g.position_size = 0.8                 # 基础仓位比例
 
     # ==================== 选股参数（来自价格行为策略） ====================
@@ -53,9 +53,9 @@ def initialize(context):
     g.atr_stop_mult = 2.0
 
     # ==================== trade2at4at5at4 盈利回撤止盈 ====================
-    g.trail_profit_threshold = 0.50    # 浮盈超过50%启用
-    g.trail_stop_half = 0.08           # 自高点回撤8% → 减仓50%
-    g.trail_stop_full = 0.12           # 自高点回撤12% → 清仓
+    g.trail_profit_threshold = 0.40    # 浮盈超过50%启用
+    g.trail_stop_half = 0.06           # 自高点回撤8% → 减仓50%
+    g.trail_stop_full = 0.10           # 自高点回撤12% → 清仓
 
     # ==================== trade2at4at5 动量排序 ====================
     g.momentum_factor_yesterday = 0.5    # 昨日涨跌幅权重：涨1%=+1分
