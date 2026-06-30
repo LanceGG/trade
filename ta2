@@ -58,8 +58,8 @@ def initialize(context):
     g.trail_stop_full = 0.12           # 自高点回撤12% → 清仓
 
     # ==================== trade2at4at5 动量排序 ====================
-    g.momentum_factor_yesterday = 0.5    # 昨日涨跌幅权重：涨1%=+1分
-    g.momentum_factor_today = 0.5          # 今日涨跌幅权重：涨1%=+1分
+    g.momentum_factor_yesterday = 1    # 昨日涨跌幅权重：涨1%=+1分
+    g.momentum_factor_today = 0          # 今日涨跌幅权重：涨1%=+1分
 
     # ==================== 状态变量 ====================
     g.today_stocks = []                    # 当日精选股票列表
