@@ -13,7 +13,7 @@
 # trade2 单点回撤优化系列 — 基于 trade2，每次只改一项，便于 A/B 回测
 # 基准逻辑与 trade2 相同：3只持仓、CANSLIM+价格行为、止损8%+通道3日+双死叉
 
-# tb3 — 基于 ta2：买入分白名单 86~92，优先级 90→91→92→89→88→87→86
+# tb3 — 基于 ta2：弱市(大盘分<40)仅买入90~94分，非弱市与ta2相同
 
 import talib
 import numpy as np
@@ -70,9 +70,10 @@ def initialize(context):
     g.position_high = {}                   # 持仓最高价（盈利回撤止盈）
     g.trail_half_done = {}                 # 是否已执行过半仓减仓
 
-    # ==================== tb3 买入分过滤与排序 ====================
-    g.allowed_buy_score_ints = {86, 87, 88, 89, 90, 91, 92}
-    g.buy_score_priority = [90, 91, 92, 89, 88, 87, 86]
+    # ==================== tb3 弱市买入分过滤 ====================
+    g.weak_market_score_threshold = 40   # 大盘分 < 40 视为弱市
+    g.weak_market_score_min = 90         # 弱市仅买 90~94 分
+    g.weak_market_score_max = 95
 
     # ==================== 分析日志 ====================
     g.strategy_tag = 'tb3'
@@ -321,24 +322,22 @@ def _buy_score_int(score):
     return int(score)
 
 
-def _is_tb3_allowed_score(score):
-    return _buy_score_int(score) in g.allowed_buy_score_ints
+def _is_tb3_buy_allowed(score, market_score):
+    """弱市仅允许90~94分；非弱市与ta2相同"""
+    if market_score < g.weak_market_score_threshold:
+        s = _buy_score_int(score)
+        return g.weak_market_score_min <= s < g.weak_market_score_max
+    return True
 
 
-def _tb3_buy_sort_key(item):
-    s = _buy_score_int(item['score'])
-    pri = g.buy_score_priority.index(s) if s in g.buy_score_priority else 999
-    return (pri, -item['score'])
-
-
-def _apply_tb3_score_filter_and_sort(pool):
-    filtered = [x for x in pool if _is_tb3_allowed_score(x['score'])]
-    filtered.sort(key=_tb3_buy_sort_key)
-    return filtered
+def _apply_tb3_weak_market_filter(pool, market_score):
+    if market_score >= g.weak_market_score_threshold:
+        return pool
+    return [x for x in pool if _is_tb3_buy_allowed(x['score'], market_score)]
 
 
 def _refresh_today_stocks_momentum(context):
-    """10:00 买入前刷新今日动量，tb3 白名单过滤并按优先级排序"""
+    """10:00 买入前刷新今日动量并重新排序"""
     for item in g.today_stocks:
         final, y, t = _apply_momentum_score(
             item['base_score'], item['code'], context, include_today=True)
@@ -346,11 +345,7 @@ def _refresh_today_stocks_momentum(context):
         item['today_mom'] = t
         item['momentum'] = y + t
         item['score'] = final
-    before = len(g.today_stocks)
-    g.today_stocks = _apply_tb3_score_filter_and_sort(g.today_stocks)
-    if before != len(g.today_stocks):
-        log.info(f"[tb3分数过滤] 10:00 {before}只 → {len(g.today_stocks)}只 "
-                 f"(仅允许{g.buy_score_priority})")
+    g.today_stocks.sort(key=lambda x: -x['score'])
 
 
 def _check_stop_loss(context, market_score, label=''):
@@ -527,10 +522,7 @@ def before_trading_start(context):
     log.info(f"📊 Stage2形态: 技术面{len(stock_pool)} → 通过{len(final_pool)} "
              f"(形态不符/非Stage2: {stage_reject} 异常: {stage_errors})")
     _log_momentum_stats(final_pool, '07:30')
-    before_filter = len(final_pool)
-    final_pool = _apply_tb3_score_filter_and_sort(final_pool)
-    log.info(f"[tb3分数过滤] 07:30 Stage2 {before_filter}只 → {len(final_pool)}只 "
-             f"(仅允许{g.buy_score_priority})")
+    final_pool.sort(key=lambda x: -x['score'])
     final_pool = final_pool[:g.max_stock_output]
     g.today_stocks = final_pool[:]
 
@@ -715,6 +707,12 @@ def market_open_trade(context):
         pre_rank = {item['code']: (i + 1, item['score'])
                     for i, item in enumerate(g.today_stocks[:g.max_stock_output])}
         _refresh_today_stocks_momentum(context)
+        if market_score < g.weak_market_score_threshold:
+            before = len(g.today_stocks)
+            g.today_stocks = _apply_tb3_weak_market_filter(g.today_stocks, market_score)
+            g.today_stocks.sort(key=lambda x: -x['score'])
+            log.info(f"[tb3弱市过滤] 大盘分{market_score:.0f} 仅买90~94分: "
+                     f"{before}只→{len(g.today_stocks)}只")
         if g.analysis_log:
             for i, item in enumerate(g.today_stocks[:min(10, len(g.today_stocks))]):
                 code = item['code']
@@ -727,7 +725,8 @@ def market_open_trade(context):
                              f"排名{old_r}→{new_r} 分{old_s:.1f}→{item['score']:.1f} "
                              f"今动量{item['today_mom']:+.1f}")
         _log_momentum_stats(g.today_stocks[:g.max_stock_output], '10:00')
-        log.info("📊 10:00 tb3优先级排序后候选（90→91→92→89→88→87→86）:")
+        log.info("📊 10:00动量重排后候选" +
+                 ("（弱市仅90~94分）" if market_score < g.weak_market_score_threshold else "（跌1%扣1分，涨1%加1分）") + ":")
         for item in g.today_stocks[:g.max_stock_output]:
             log.info(f"  {item['code'].split('.')[0]} {item['name']} "
                      f"基础{item['base_score']} 昨{item['yesterday_mom']:+.1f} "
@@ -757,8 +756,8 @@ def market_open_trade(context):
                 log.info(f"{stock} 今日已被卖出，当天不再买入")
                 continue
 
-            if not _is_tb3_allowed_score(item['score']):
-                log.info(f"{stock} 买入分{_buy_score_int(item['score'])}不在白名单，跳过")
+            if not _is_tb3_buy_allowed(item['score'], market_score):
+                log.info(f"{stock} 弱市买入分{_buy_score_int(item['score'])}不在90~94，跳过")
                 continue
 
             current_data = get_current_data()
