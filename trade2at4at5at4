@@ -13,7 +13,7 @@
 # trade2 单点回撤优化系列 — 基于 trade2，每次只改一项，便于 A/B 回测
 # 基准逻辑与 trade2 相同：3只持仓、CANSLIM+价格行为、止损8%+通道3日+双死叉
 
-# trade2at4at5at4 — 基于 trade2at4at5：昨日大跌>5% 剔除
+# trade2at4at5at4 — 基于 trade2at4at5：盈利>50% 高点回撤减仓/清仓
 
 import talib
 import numpy as np
@@ -52,12 +52,14 @@ def initialize(context):
     g.hard_stop_score_threshold = 40
     g.atr_stop_mult = 2.0
 
+    # ==================== trade2at4at5at4 盈利回撤止盈 ====================
+    g.trail_profit_threshold = 0.50    # 浮盈超过50%启用
+    g.trail_stop_half = 0.08           # 自高点回撤8% → 减仓50%
+    g.trail_stop_full = 0.12           # 自高点回撤12% → 清仓
+
     # ==================== trade2at4at5 动量排序 ====================
     g.momentum_factor_yesterday = 0.5    # 昨日涨跌幅权重：涨1%=+1分
     g.momentum_factor_today = 0.5          # 今日涨跌幅权重：涨1%=+1分
-
-    # ==================== trade2at4at5at4 选股过滤 ====================
-    g.yesterday_drop_filter = 0.05       # 昨日跌幅超过5%剔除
 
     # ==================== 状态变量 ====================
     g.today_stocks = []                    # 当日精选股票列表
@@ -65,6 +67,8 @@ def initialize(context):
     g.buy_info = {}                        # 买入信息记录
     g.daily_nav = []                       # 净值记录
     g.break_upper_count = {}               # 记录每只股票跌破上轨下沿的天数
+    g.position_high = {}                   # 持仓最高价（盈利回撤止盈）
+    g.trail_half_done = {}                 # 是否已执行过半仓减仓
     # ==================== 定时运行 ====================
     run_daily(before_trading_start, time='07:30')
     run_daily(market_open_trade, time='10:00')
@@ -92,6 +96,55 @@ def _get_stop_threshold(stock, context, market_score):
     if atr_pct is not None:
         threshold = max(threshold, g.atr_stop_mult * atr_pct)
     return threshold
+
+
+def _update_position_high(stock, price):
+    if price <= 0 or not np.isfinite(price):
+        return
+    prev = g.position_high.get(stock, price)
+    g.position_high[stock] = max(prev, price)
+
+
+def _cleanup_position_state(stock):
+    g.sold_today.add(stock)
+    g.buy_info.pop(stock, None)
+    g.break_upper_count.pop(stock, None)
+    g.position_high.pop(stock, None)
+    g.trail_half_done.pop(stock, None)
+
+
+def _check_profit_trailing(stock, current_price, pnl_ratio):
+    """浮盈>50%时：高点回撤8%减仓50%，回撤12%清仓。返回 'full' / 'half' / None"""
+    _update_position_high(stock, current_price)
+    if pnl_ratio <= g.trail_profit_threshold:
+        return None
+    peak = g.position_high.get(stock, current_price)
+    if peak <= 0:
+        return None
+    dd_from_peak = (current_price - peak) / peak
+    if dd_from_peak <= -g.trail_stop_full:
+        log.info(f"📉 盈利回撤清仓 {stock}，浮盈{pnl_ratio*100:.1f}%，"
+                 f"自高点{peak:.2f}回撤{abs(dd_from_peak*100):.1f}%")
+        return 'full'
+    if dd_from_peak <= -g.trail_stop_half and not g.trail_half_done.get(stock, False):
+        log.info(f"📉 盈利回撤减半 {stock}，浮盈{pnl_ratio*100:.1f}%，"
+                 f"自高点{peak:.2f}回撤{abs(dd_from_peak*100):.1f}%")
+        return 'half'
+    return None
+
+
+def _apply_profit_trailing(stock, position, current_price, pnl_ratio, context):
+    action = _check_profit_trailing(stock, current_price, pnl_ratio)
+    if action == 'full':
+        _safe_order_target_value(stock, 0, current_price, 'sell', context)
+        _cleanup_position_state(stock)
+        return True
+    if action == 'half':
+        target_value = position.value * 0.5
+        _safe_order_target_value(stock, target_value, current_price, 'sell', context)
+        g.trail_half_done[stock] = True
+        return True
+    return False
 
 
 def _get_pre_close(stock, context):
@@ -189,16 +242,29 @@ def _check_stop_loss(context, market_score, label=''):
             log.info(f"✂️ [{label}]止损卖出 {stock}，阈值{-threshold*100:.1f}%，"
                      f"成本{cost:.2f}，现价{current_price:.2f}，亏损{abs(pnl_ratio*100):.1f}%")
             _safe_order_target_value(stock, 0, current_price, 'sell', context)
-            g.sold_today.add(stock)
-            if stock in g.buy_info:
-                del g.buy_info[stock]
-            if stock in g.break_upper_count:
-                del g.break_upper_count[stock]
+            _cleanup_position_state(stock)
+
+
+def _check_profit_trailing_all(context, label=''):
+    for stock in list(context.portfolio.positions.keys()):
+        position = context.portfolio.positions[stock]
+        if position.total_amount == 0:
+            continue
+        current_data = get_current_data()
+        if current_data[stock].paused:
+            continue
+        current_price = current_data[stock].last_price
+        if not np.isfinite(current_price) or current_price <= 0:
+            continue
+        cost = position.avg_cost
+        pnl_ratio = (current_price - cost) / cost
+        _apply_profit_trailing(stock, position, current_price, pnl_ratio, context)
 
 
 def afternoon_stop_check(context):
     market_score = get_market_score(context)
-    log.info(f"\n===== {context.current_dt.strftime('%Y-%m-%d')} trade2at4at5at4 14:30止损复检 =====")
+    log.info(f"\n===== {context.current_dt.strftime('%Y-%m-%d')} trade2at4at5at4 14:30复检 =====")
+    _check_profit_trailing_all(context, label='14:30')
     _check_stop_loss(context, market_score, label='14:30')
 
 
@@ -277,8 +343,7 @@ def before_trading_start(context):
 
     # 获取选股池（CANSLIM + 价格行为）
     stock_pool, stats = get_canslim_pool(context)
-    log.info(f"📈 选股统计: 基本面初筛 {stats['fundamental']} 只 → 技术面通过 {stats['technical_pass']} 只"
-             f"(昨日大跌剔除 {stats['yesterday_drop_excluded']} 只)")
+    log.info(f"📈 选股统计: 基本面初筛 {stats['fundamental']} 只 → 技术面通过 {stats['technical_pass']} 只")
 
     final_pool = []
     for stock in stock_pool:
@@ -398,43 +463,33 @@ def market_open_trade(context):
         if not np.isfinite(current_price) or current_price <= 0:
             continue
 
-        # 2.1 固定止损检查
+        # 2.1 止损检查
         cost = position.avg_cost
         pnl_ratio = (current_price - cost) / cost
 
-        # ← 修改：先检查止盈50%
-        # 止损8%
-        # 止损8%
         stop_threshold = _get_stop_threshold(stock, context, market_score)
         if pnl_ratio <= -stop_threshold:
             log.info(f"✂️ [10:00]止损卖出 {stock}，阈值{-stop_threshold*100:.1f}%，"
                      f"成本{cost:.2f}，现价{current_price:.2f}，亏损{abs(pnl_ratio*100):.1f}%")
             _safe_order_target_value(stock, 0, current_price, 'sell', context)
-            g.sold_today.add(stock)
             sell_stocks.append(stock)
-            if stock in g.buy_info:
-                del g.buy_info[stock]
-            if stock in g.break_upper_count:
-                del g.break_upper_count[stock]
+            _cleanup_position_state(stock)
             continue
-        # ← 新增：连续3天跌破上轨下沿（趋势1）止损
-        # ← 检查连续3天收盘跌破上轨下沿（计数在after_market_close更新）
+
+        # 2.2 盈利回撤止盈（浮盈>50%：高点回撤8%减半，12%清仓）
+        if _apply_profit_trailing(stock, position, current_price, pnl_ratio, context):
+            continue
+
+        # 2.3 连续3天跌破上轨下沿
         if g.break_upper_count.get(stock, 0) >= 3:
             log.info(f"📉 连续3天收盘跌破上轨下沿卖出 {stock}，"
                     f"盈利{pnl_ratio*100:.1f}%")
             _safe_order_target_value(stock, 0, current_price, 'sell', context)
-            g.sold_today.add(stock)
             sell_stocks.append(stock)
-            if stock in g.buy_info:
-                del g.buy_info[stock]
-            if stock in g.break_upper_count:
-                del g.break_upper_count[stock]
+            _cleanup_position_state(stock)
             continue
 
-
-
-
-        # 2.2 双死叉卖出（BBI + MACD）
+        # 2.4 双死叉卖出（BBI + MACD）
         try:
             hist = attribute_history(stock, 250, '1d', ['close'], skip_paused=True, df=False)
             if len(hist['close']) >= 50:
@@ -463,13 +518,9 @@ def market_open_trade(context):
 
                 if bbi_dead and macd_dead:
                     log.info(f"📉 双死叉卖出 {stock}（BBI死叉 + MACD死叉），现价{current_price:.2f}")
-                    _safe_order_target_value(stock, 0, current_price, 'sell', context)  # ← 使用安全下单
-                    g.sold_today.add(stock)
+                    _safe_order_target_value(stock, 0, current_price, 'sell', context)
                     sell_stocks.append(stock)
-                    if stock in g.buy_info:
-                        del g.buy_info[stock]
-                    if stock in g.break_upper_count:
-                        del g.break_upper_count[stock]
+                    _cleanup_position_state(stock)
         except Exception as e:
             if g.debug_mode:
                 log.warn(f"计算死叉信号 {stock} 出错: {e}")
@@ -569,6 +620,8 @@ def market_open_trade(context):
                     'setup': item['setup'],
                     'score': item['score']
                 }
+                g.position_high[stock] = current_price
+                g.trail_half_done.pop(stock, None)
 
                 available_cash -= target_value
 
@@ -627,6 +680,14 @@ def after_market_close(context):
         position = context.portfolio.positions[stock]
         if position.total_amount == 0:
             continue
+
+        try:
+            df_today = get_price(stock, end_date=current_date, frequency='1d',
+                                 fields=['close'], skip_paused=False, count=1)
+            if len(df_today) > 0:
+                _update_position_high(stock, float(df_today['close'].iloc[-1]))
+        except Exception:
+            pass
 
         trend1 = calc_dktd_channel(stock, context)
         if trend1 is not None:
@@ -859,7 +920,6 @@ def get_canslim_pool(context):
         log.info(f"🔍 ST/北交所过滤后: {filtered_cnt} 只")
 
     result = []
-    yesterday_drop_excluded = 0
     for s in filtered:
         try:
             hist = attribute_history(s, 250, '1d', ['high', 'close', 'volume'], skip_paused=True, df=False)
@@ -880,13 +940,6 @@ def get_canslim_pool(context):
             if current_price < ma200[-1] * 0.95:
                 continue
 
-            # 昨日大跌过滤（close[-1] 相对 close[-2]）
-            if len(hist['close']) >= 2 and hist['close'][-2] > 0:
-                yesterday_ret = (hist['close'][-1] - hist['close'][-2]) / hist['close'][-2]
-                if yesterday_ret < -g.yesterday_drop_filter:
-                    yesterday_drop_excluded += 1
-                    continue
-
             # 价格和成交额过滤
             if current_price < g.min_price:
                 continue
@@ -900,14 +953,10 @@ def get_canslim_pool(context):
                 log.warn(f"技术面过滤 {s} 出错: {e}")
             continue
 
-    if g.debug_mode and yesterday_drop_excluded > 0:
-        log.info(f"📉 昨日大跌>{g.yesterday_drop_filter*100:.0f}%剔除: {yesterday_drop_excluded} 只")
-
     stats = {
         'fundamental': fundamental_cnt,
         'filtered_exclude': filtered_cnt,
-        'technical_pass': len(result),
-        'yesterday_drop_excluded': yesterday_drop_excluded
+        'technical_pass': len(result)
     }
     return result, stats
 
