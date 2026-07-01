@@ -10,7 +10,7 @@
 # 标题：集思广益
 # 作者：liyiyyds
 
-# tb4 — 基于 ta2：计分 = 形态基础分 + EMA10回踩加分，去掉昨涨跌幅计分
+# tb4 — 基于 ta2：计分 = 形态基础分 + 昨动量 + EMA10回踩加分
 
 import talib
 import numpy as np
@@ -32,7 +32,7 @@ def initialize(context):
     set_slippage(FixedSlippage(0.001))
 
     # ==================== 仓位管理参数（来自趋势跟踪策略） ====================
-    g.max_holdings = 10                     # 最大持仓数量
+    g.max_holdings = 5                     # 最大持仓数量
     g.position_size = 0.8                 # 基础仓位比例
 
     # ==================== 选股参数（来自价格行为策略） ====================
@@ -49,10 +49,19 @@ def initialize(context):
     g.hard_stop_score_threshold = 40
     g.atr_stop_mult = 2.0
 
-    # ==================== 盈利回撤止盈 ====================
+    # ==================== trade2at4at5at4 盈利回撤止盈 ====================
     g.trail_profit_threshold = 0.50    # 浮盈超过50%启用
     g.trail_stop_half = 0.08           # 自高点回撤8% → 减仓50%
     g.trail_stop_full = 0.12           # 自高点回撤12% → 清仓
+
+    # ==================== trade2at4at5 动量排序（与 ta2 相同） ====================
+    g.momentum_factor_yesterday = 1    # 昨日涨跌幅权重：涨1%=+1分
+    g.momentum_factor_today = 0          # 今日涨跌幅权重：涨1%=+1分
+
+    # ==================== tb4 EMA10 回踩加分 ====================
+    g.ema_touch_lookback = 10            # 近 N 日检测 EMA10 触及
+    g.ema_touch_bonus_above = 2          # 触及且收在 EMA10 线上
+    g.ema_touch_bonus_below = 1          # 触及但收在 EMA10 线下
 
     # ==================== 状态变量 ====================
     g.today_stocks = []                    # 当日精选股票列表
@@ -62,10 +71,6 @@ def initialize(context):
     g.break_upper_count = {}               # 记录每只股票跌破上轨下沿的天数
     g.position_high = {}                   # 持仓最高价（盈利回撤止盈）
     g.trail_half_done = {}                 # 是否已执行过半仓减仓
-
-    # ==================== tb4 EMA10 回踩加分 ====================
-    g.ema_touch_lookback = 10            # 近 N 日检测 EMA10 触及
-    g.ema_touch_bonus = 1                # 触及 EMA10（收线上或线下）均 +1
 
     # ==================== 分析日志 ====================
     g.strategy_tag = 'tb4'
@@ -245,8 +250,49 @@ def _apply_profit_trailing(stock, position, current_price, pnl_ratio, context, l
     return False
 
 
+def _get_pre_close(stock, context):
+    """获取昨收价（聚宽 current_data 无 pre_close 字段）"""
+    try:
+        hist = attribute_history(stock, 1, '1d', ['close'], skip_paused=True, df=False)
+        if len(hist['close']) >= 1:
+            pc = hist['close'][-1]
+            if np.isfinite(pc) and pc > 0:
+                return float(pc)
+    except Exception:
+        pass
+    return None
+
+
+def _get_yesterday_return_pct(stock, context):
+    """昨日涨跌幅（百分点），涨1%返回+1"""
+    try:
+        hist = attribute_history(stock, 2, '1d', ['close'], skip_paused=True, df=False)
+        if len(hist['close']) < 2 or hist['close'][-2] <= 0:
+            return 0.0
+        return float((hist['close'][-1] / hist['close'][-2] - 1) * 100)
+    except Exception:
+        return 0.0
+
+
+def _get_today_return_pct(stock, context):
+    """今日涨跌幅（百分点），涨1%返回+1；10:00用现价，盘前用开盘价"""
+    pre_close = _get_pre_close(stock, context)
+    if pre_close is None:
+        return 0.0
+    try:
+        cd = get_current_data()[stock]
+        price = cd.last_price
+        if not np.isfinite(price) or price <= 0:
+            price = cd.day_open
+        if np.isfinite(price) and price > 0:
+            return float((price - pre_close) / pre_close * 100)
+    except Exception:
+        pass
+    return 0.0
+
+
 def _get_ema10_touch_bonus(stock, context):
-    """近 N 日内任意一天触及 EMA10（收线上或线下）均 +1"""
+    """近 N 日内任意一天触及 EMA10：收线上+2，收线下+1（取最高档）"""
     try:
         need = g.ema_touch_lookback + 12
         hist = attribute_history(stock, need, '1d', ['close'], skip_paused=True, df=False)
@@ -254,25 +300,57 @@ def _get_ema10_touch_bonus(stock, context):
         if len(close) < g.ema_touch_lookback + 2:
             return 0.0
         ema10 = talib.EMA(close, timeperiod=10)
+        bonus = 0.0
         for i in range(-g.ema_touch_lookback, 0):
             if close[i] <= ema10[i] * 1.01:
-                return float(g.ema_touch_bonus)
-        return 0.0
+                if close[i] >= ema10[i]:
+                    bonus = max(bonus, float(g.ema_touch_bonus_above))
+                else:
+                    bonus = max(bonus, float(g.ema_touch_bonus_below))
+        return bonus
     except Exception:
         return 0.0
 
 
 def _apply_momentum_score(base_score, stock, context, include_today=False):
-    """形态基础分 + EMA10 回踩加分（tb4 不含昨/今涨跌幅）"""
+    """形态基础分 + 昨/今动量分 + EMA10 回踩加分"""
+    y = _get_yesterday_return_pct(stock, context) * g.momentum_factor_yesterday
+    t = (_get_today_return_pct(stock, context) * g.momentum_factor_today
+         if include_today else 0.0)
     ema_bonus = _get_ema10_touch_bonus(stock, context)
-    return base_score + ema_bonus, ema_bonus
+    return base_score + y + t + ema_bonus, y, t, ema_bonus
 
 
-def _log_score_stats(pool, label):
+def _log_momentum_stats(pool, label):
+    """汇总动量加减分：跌为负分，涨为正分"""
     if not pool:
         return
-    e_pos = sum(1 for item in pool if item.get('ema_bonus', 0) > 0)
-    log.info(f"📊 {label}计分统计: {len(pool)}只 | EMA加分{e_pos}只")
+    y_list = [item['yesterday_mom'] for item in pool]
+    t_list = [item['today_mom'] for item in pool]
+    m_list = [item['momentum'] for item in pool]
+    e_list = [item.get('ema_bonus', 0) for item in pool]
+    y_neg = sum(1 for v in y_list if v < 0)
+    t_neg = sum(1 for v in t_list if v < 0)
+    m_neg = sum(1 for v in m_list if v < 0)
+    e_pos = sum(1 for v in e_list if v > 0)
+    log.info(f"📉 {label}动量统计: {len(pool)}只 | "
+             f"昨扣分{y_neg}只(均{y_list and sum(y_list)/len(y_list):+.2f}) "
+             f"今扣分{t_neg}只(均{t_list and sum(t_list)/len(t_list):+.2f}) | "
+             f"合计动量负分{m_neg}只 区间[{min(m_list):+.1f},{max(m_list):+.1f}] | "
+             f"EMA加分{e_pos}只")
+
+
+def _refresh_today_stocks_momentum(context):
+    """10:00 买入前刷新今日动量并重新排序"""
+    for item in g.today_stocks:
+        final, y, t, ema_bonus = _apply_momentum_score(
+            item['base_score'], item['code'], context, include_today=True)
+        item['yesterday_mom'] = y
+        item['today_mom'] = t
+        item['ema_bonus'] = ema_bonus
+        item['momentum'] = y + t + ema_bonus
+        item['score'] = final
+    g.today_stocks.sort(key=lambda x: -x['score'])
 
 
 def _check_stop_loss(context, market_score, label=''):
@@ -426,14 +504,17 @@ def before_trading_start(context):
         try:
             stage, score, setup = detect_cycle_stage(stock, context)
             if stage == 2 and setup in ['wedge_pop', 'ema_crossback', 'base_break']:
-                final_score, ema_bonus = _apply_momentum_score(
-                    score, stock, context)
+                final_score, y_mom, t_mom, ema_bonus = _apply_momentum_score(
+                    score, stock, context, include_today=False)
                 final_pool.append({
                     'code': stock,
                     'name': get_security_info(stock).display_name,
                     'base_score': score,
                     'setup': setup,
+                    'yesterday_mom': y_mom,
+                    'today_mom': t_mom,
                     'ema_bonus': ema_bonus,
+                    'momentum': y_mom + t_mom + ema_bonus,
                     'score': final_score
                 })
             else:
@@ -446,7 +527,7 @@ def before_trading_start(context):
 
     log.info(f"📊 Stage2形态: 技术面{len(stock_pool)} → 通过{len(final_pool)} "
              f"(形态不符/非Stage2: {stage_reject} 异常: {stage_errors})")
-    _log_score_stats(final_pool, '07:30')
+    _log_momentum_stats(final_pool, '07:30')
     final_pool.sort(key=lambda x: -x['score'])
     final_pool = final_pool[:g.max_stock_output]
     g.today_stocks = final_pool[:]
@@ -460,7 +541,8 @@ def before_trading_start(context):
         code_6 = item['code'].split('.')[0]
         code_list.append(code_6)
         log.info(f"{code_6}  {item['name']}  | 形态:{item['setup']}  "
-                 f"基础:{item['base_score']} EMA:{item['ema_bonus']:+.0f} "
+                 f"基础:{item['base_score']} 昨动量:{item['yesterday_mom']:+.1f} "
+                 f"今动量:{item['today_mom']:+.1f} EMA:{item['ema_bonus']:+.0f} "
                  f"总分:{item['score']:.1f}")
 
     if not final_pool:
@@ -629,10 +711,26 @@ def market_open_trade(context):
     elif market_score < 30:
         log.info(f"大盘评分{market_score:.0f}低于30，暂停买入")
     else:
-        log.info("📊 10:00买入候选（形态基础分 + EMA回踩+1）:")
+        pre_rank = {item['code']: (i + 1, item['score'])
+                    for i, item in enumerate(g.today_stocks[:g.max_stock_output])}
+        _refresh_today_stocks_momentum(context)
+        if g.analysis_log:
+            for i, item in enumerate(g.today_stocks[:min(10, len(g.today_stocks))]):
+                code = item['code']
+                if code not in pre_rank:
+                    continue
+                old_r, old_s = pre_rank[code]
+                new_r = i + 1
+                if old_r != new_r or abs(old_s - item['score']) > 0.01:
+                    log.info(f"[排名变化] {code.split('.')[0]} {item['name']} "
+                             f"排名{old_r}→{new_r} 分{old_s:.1f}→{item['score']:.1f} "
+                             f"今动量{item['today_mom']:+.1f}")
+        _log_momentum_stats(g.today_stocks[:g.max_stock_output], '10:00')
+        log.info("📊 10:00动量重排后候选（昨动量+EMA回踩加分）:")
         for item in g.today_stocks[:g.max_stock_output]:
             log.info(f"  {item['code'].split('.')[0]} {item['name']} "
-                     f"基础{item['base_score']} EMA:{item.get('ema_bonus', 0):+.0f} "
+                     f"基础{item['base_score']} 昨{item['yesterday_mom']:+.1f} "
+                     f"今{item['today_mom']:+.1f} EMA:{item.get('ema_bonus', 0):+.0f} "
                      f"总分{item['score']:.1f}")
 
         slots_available = g.max_holdings - current_count
@@ -716,6 +814,7 @@ def market_open_trade(context):
 
                 _log_trade('BUY', stock, context, '新开仓', None,
                            f"总分{item['score']:.1f} 基础{item['base_score']} "
+                           f"昨动量{item['yesterday_mom']:+.1f} 今动量{item['today_mom']:+.1f} "
                            f"EMA:{item.get('ema_bonus', 0):+.0f} "
                            f"形态{item['setup']} 价{current_price:.2f} 目标市值{target_value:.0f}")
 
