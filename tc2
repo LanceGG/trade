@@ -10,7 +10,7 @@
 # 标题：集思广益
 # 作者：liyiyyds
 
-# tb4 — 基于 ta2：计分 = 形态基础分 + 昨动量 + EMA10回踩加分
+# tc2 — 基于 tb4；tc2.md：大盘分<50 时过滤 MA120 斜率<0 的股票
 
 import talib
 import numpy as np
@@ -63,6 +63,10 @@ def initialize(context):
     g.ema_touch_bonus_above = 2          # 触及且收在 EMA10 线上
     g.ema_touch_bonus_below = 1          # 触及但收在 EMA10 线下
 
+    # ==================== tc2 条件 MA120 过滤 ====================
+    g.ma120_filter_score_threshold = 50    # 大盘分低于此值时启用
+    g.ma120_slope_lookback = 20            # 近20日 MA120 斜率
+
     # ==================== 状态变量 ====================
     g.today_stocks = []                    # 当日精选股票列表
     g.sold_today = set()                   # 当日已卖出的股票
@@ -73,7 +77,7 @@ def initialize(context):
     g.trail_half_done = {}                 # 是否已执行过半仓减仓
 
     # ==================== 分析日志 ====================
-    g.strategy_tag = 'tb4'
+    g.strategy_tag = 'tc2'
     g.analysis_log = True                  # 结构化分析日志（巡检/漏斗/跟踪预警）
     g._daily_sells = []                    # [(stock, reason, pnl_ratio)]
     g._daily_buys = []                     # [(stock, score, setup)]
@@ -489,10 +493,13 @@ def before_trading_start(context):
     g.sold_today.clear()
 
     stock_pool, stats = get_canslim_pool(context)
+    if stats.get('ma120_filter_on'):
+        log.info(f"[tc2] 大盘分{stats.get('market_score', 0):.0f}<{g.ma120_filter_score_threshold}，启用 MA120 斜率<0 过滤")
     log.info(f"📈 选股漏斗: 基本面{stats['fundamental']} → 合规{stats['filtered_exclude']} → "
              f"技术面{stats['technical_pass']} "
              f"(52周回撤剔除{stats.get('corr_excluded', 0)} "
              f"MA200剔除{stats.get('ma200_excluded', 0)} "
+             f"MA120斜率<0剔除{stats.get('ma120_excluded', 0)} "
              f"低价剔除{stats.get('price_excluded', 0)} "
              f"成交额剔除{stats.get('volume_excluded', 0)} "
              f"历史不足{stats.get('hist_short', 0)})")
@@ -1083,6 +1090,24 @@ def _detect_base_break(close, high, low, ema10, ema20, volume, v20):
         return False, 0
     return True, 85
 
+
+
+def _ma120_slope_ok(close):
+    """近20日 MA120 斜率>=0；斜率<0 剔除"""
+    lookback = g.ma120_slope_lookback
+    if len(close) < 120 + lookback:
+        return False
+    ma120 = talib.SMA(close, timeperiod=120)
+    if len(ma120) < lookback + 1:
+        return False
+    ma_now = ma120[-1]
+    ma_prev = ma120[-1 - lookback]
+    if not np.isfinite(ma_now) or not np.isfinite(ma_prev) or ma_prev <= 0:
+        return False
+    slope = (ma_now - ma_prev) / ma_prev
+    return slope >= 0
+
+
 def get_canslim_pool(context):
     """CANSLIM基本面 + 技术面选股"""
     q = query(
@@ -1148,8 +1173,10 @@ def get_canslim_pool(context):
         log.info(f"🔍 ST/北交所过滤后: {filtered_cnt} 只")
 
     result = []
-    hist_short = corr_excluded = ma200_excluded = 0
+    hist_short = corr_excluded = ma200_excluded = ma120_excluded = 0
     price_excluded = volume_excluded = 0
+    market_score = get_market_score(context)
+    ma120_filter_on = market_score < g.ma120_filter_score_threshold
     for s in filtered:
         try:
             hist = attribute_history(s, 250, '1d', ['high', 'close', 'volume'], skip_paused=True, df=False)
@@ -1170,6 +1197,10 @@ def get_canslim_pool(context):
                 continue
             if current_price < ma200[-1] * 0.95:
                 ma200_excluded += 1
+                continue
+
+            if ma120_filter_on and not _ma120_slope_ok(hist['close']):
+                ma120_excluded += 1
                 continue
 
             if current_price < g.min_price:
@@ -1193,6 +1224,9 @@ def get_canslim_pool(context):
         'hist_short': hist_short,
         'corr_excluded': corr_excluded,
         'ma200_excluded': ma200_excluded,
+        'ma120_excluded': ma120_excluded,
+        'market_score': market_score,
+        'ma120_filter_on': ma120_filter_on,
         'price_excluded': price_excluded,
         'volume_excluded': volume_excluded,
     }
