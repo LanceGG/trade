@@ -10,7 +10,7 @@
 # 标题：集思广益
 # 作者：liyiyyds
 
-# tb4 — 基于 ta2：计分 = 形态基础分 + 昨动量 + EMA10回踩加分
+# tc1 — 基于 tb4；tc1.md：持仓 MA120 斜率<0 时止损阈值减半
 
 import talib
 import numpy as np
@@ -63,6 +63,10 @@ def initialize(context):
     g.ema_touch_bonus_above = 2          # 触及且收在 EMA10 线上
     g.ema_touch_bonus_below = 1          # 触及但收在 EMA10 线下
 
+    # ==================== tc1 持仓 MA120 止损收紧 ====================
+    g.ma120_slope_lookback = 20            # 近20日 MA120 斜率
+    g.ma120_stop_halve = True              # 斜率<0 时止损阈值减半（-6%→-3%）
+
     # ==================== 状态变量 ====================
     g.today_stocks = []                    # 当日精选股票列表
     g.sold_today = set()                   # 当日已卖出的股票
@@ -73,7 +77,7 @@ def initialize(context):
     g.trail_half_done = {}                 # 是否已执行过半仓减仓
 
     # ==================== 分析日志 ====================
-    g.strategy_tag = 'tb4'
+    g.strategy_tag = 'tc1'
     g.analysis_log = True                  # 结构化分析日志（巡检/漏斗/跟踪预警）
     g._daily_sells = []                    # [(stock, reason, pnl_ratio)]
     g._daily_buys = []                     # [(stock, score, setup)]
@@ -116,6 +120,29 @@ def _log_trade(action, stock, context, reason, pnl_ratio=None, extra=''):
         g._daily_buys.append((stock, info.get('score', ''), info.get('setup', '')))
 
 
+
+
+def _calc_ma120_slope(stock, context):
+    """近 N 日 MA120 斜率；(ma_now - ma_prev) / ma_prev，失败返回 None"""
+    try:
+        lookback = g.ma120_slope_lookback
+        need = 120 + lookback + 5
+        hist = attribute_history(stock, need, '1d', ['close'], skip_paused=True, df=False)
+        close = np.array(hist['close'], dtype=float)
+        if len(close) < 120 + lookback:
+            return None
+        ma120 = talib.SMA(close, timeperiod=120)
+        if len(ma120) < lookback + 1:
+            return None
+        ma_now = ma120[-1]
+        ma_prev = ma120[-1 - lookback]
+        if not np.isfinite(ma_now) or not np.isfinite(ma_prev) or ma_prev <= 0:
+            return None
+        return float((ma_now - ma_prev) / ma_prev)
+    except Exception:
+        return None
+
+
 def _explain_stop_threshold(stock, context, market_score):
     hard = g.hard_stop
     bear = market_score < g.hard_stop_score_threshold
@@ -125,9 +152,17 @@ def _explain_stop_threshold(stock, context, market_score):
     threshold = after_bear
     if atr_part is not None:
         threshold = max(threshold, atr_part)
+    before_ma120 = threshold
+    ma120_slope = _calc_ma120_slope(stock, context)
+    ma120_halve = False
+    if g.ma120_stop_halve and ma120_slope is not None and ma120_slope < 0:
+        threshold = threshold * 0.5
+        ma120_halve = True
     return threshold, {
         'hard': hard, 'bear': bear, 'after_bear': after_bear,
-        'atr_pct': atr_pct, 'atr_part': atr_part, 'final': threshold
+        'atr_pct': atr_pct, 'atr_part': atr_part,
+        'before_ma120': before_ma120, 'ma120_slope': ma120_slope,
+        'ma120_halve': ma120_halve, 'final': threshold
     }
 
 
@@ -135,9 +170,13 @@ def _log_stop_threshold(stock, context, market_score, label=''):
     threshold, d = _explain_stop_threshold(stock, context, market_score)
     atr_str = f"{d['atr_pct']*100:.1f}%" if d['atr_pct'] is not None else 'N/A'
     atr_final = f"{d['atr_part']*100:.1f}%" if d['atr_part'] is not None else 'N/A'
+    ma120_str = f"{d['ma120_slope']*100:+.2f}%" if d.get('ma120_slope') is not None else 'N/A'
+    halve_str = ''
+    if d.get('ma120_halve'):
+        halve_str = f" MA120斜率{ma120_str} 减半{-d['before_ma120']*100:.1f}%→"
     log.info(f"[止损阈{label}] {_stock_label(stock)} hard={d['hard']:.0%} "
              f"熊市={d['bear']} bear后={d['after_bear']:.0%} "
-             f"atr14={atr_str} 2xatr={atr_final} → 最终{-threshold*100:.1f}%")
+             f"atr14={atr_str} 2xatr={atr_final}{halve_str} → 最终{-threshold*100:.1f}%")
     return threshold
 
 
@@ -373,7 +412,9 @@ def _check_stop_loss(context, market_score, label=''):
             _log_stop_threshold(stock, context, market_score, label)
         if pnl_ratio <= -threshold:
             reason = f"止损-{-threshold*100:.1f}%"
-            if d['atr_part'] is not None and threshold == d['atr_part']:
+            if d.get('ma120_halve'):
+                reason = f"MA120止损-{-threshold*100:.1f}%"
+            elif d['atr_part'] is not None and threshold == d['atr_part']:
                 reason = f"ATR止损-{-threshold*100:.1f}%"
             elif d['bear'] and threshold == d['after_bear']:
                 reason = f"熊市止损-{-threshold*100:.1f}%"
@@ -633,7 +674,9 @@ def market_open_trade(context):
         if pnl_ratio <= -stop_threshold:
             _, d = _explain_stop_threshold(stock, context, market_score)
             reason = f"止损-{-stop_threshold*100:.1f}%"
-            if d['atr_part'] is not None and stop_threshold == d['atr_part']:
+            if d.get('ma120_halve'):
+                reason = f"MA120止损-{-stop_threshold*100:.1f}%"
+            elif d['atr_part'] is not None and stop_threshold == d['atr_part']:
                 reason = f"ATR止损-{-stop_threshold*100:.1f}%"
             _safe_order_target_value(stock, 0, current_price, 'sell', context)
             _log_trade('SELL', stock, context, reason, pnl_ratio,
