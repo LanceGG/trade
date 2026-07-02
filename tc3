@@ -10,7 +10,7 @@
 # 标题：集思广益
 # 作者：liyiyyds
 
-# tc2 — 基于 tb4；tc2.md：近半年大盘分位均<70 时，当前分位<40 不买入
+# tc3 — 基于 tb4；tc3.md：去掉大盘分<30 时不买入的限制
 
 import talib
 import numpy as np
@@ -29,7 +29,7 @@ def initialize(context):
         close_today_commission=0,
         min_commission=5
     ), type='stock')
-    set_slippage(FixedSlippage(0.001))
+    set_slippage(FixedSlippage(0.001))ß
 
     # ==================== 仓位管理参数（来自趋势跟踪策略） ====================
     g.max_holdings = 5                     # 最大持仓数量
@@ -63,11 +63,6 @@ def initialize(context):
     g.ema_touch_bonus_above = 2          # 触及且收在 EMA10 线上
     g.ema_touch_bonus_below = 1          # 触及但收在 EMA10 线下
 
-    # ==================== tc2 大盘分位买入过滤 ====================
-    g.pct_regime_lookback = 126          # 约半年交易日
-    g.pct_regime_ceiling = 70            # 近半年每日分位均低于此 → 低分位盘
-    g.pct_buy_floor = 40                 # 低分位盘下，当前分位低于此则不买入
-
     # ==================== 状态变量 ====================
     g.today_stocks = []                    # 当日精选股票列表
     g.sold_today = set()                   # 当日已卖出的股票
@@ -76,12 +71,9 @@ def initialize(context):
     g.break_upper_count = {}               # 记录每只股票跌破上轨下沿的天数
     g.position_high = {}                   # 持仓最高价（盈利回撤止盈）
     g.trail_half_done = {}                 # 是否已执行过半仓减仓
-    g.mkt_score_history = []               # 每日大盘分（expanding 分位用）
-    g.mkt_pct_history = []                 # 每日大盘历史分位
-    g.today_market_pct = None              # 当日分位（07:30 更新，10:00 买入用）
 
     # ==================== 分析日志 ====================
-    g.strategy_tag = 'tc2'
+    g.strategy_tag = 'tc3'
     g.analysis_log = True                  # 结构化分析日志（巡检/漏斗/跟踪预警）
     g._daily_sells = []                    # [(stock, reason, pnl_ratio)]
     g._daily_buys = []                     # [(stock, score, setup)]
@@ -485,48 +477,6 @@ def calculate_position_ratio(market_score):
     else:
         return 0.2   # 2成仓
 
-
-def _calc_expanding_percentile(score):
-    """当日大盘分在截至当日的历史序列中的分位（无未来数据）"""
-    hist = g.mkt_score_history
-    if not hist:
-        return 50.0
-    all_scores = hist + [score]
-    return sum(1 for s in all_scores if s <= score) / len(all_scores) * 100.0
-
-
-def _record_today_market_score(context):
-    """盘前记录大盘分与 expanding 历史分位"""
-    score = float(get_market_score(context))
-    pct = _calc_expanding_percentile(score)
-    g.mkt_score_history.append(score)
-    g.mkt_pct_history.append(float(pct))
-    g.today_market_pct = float(pct)
-    return score, pct
-
-
-def _is_prolonged_low_percentile():
-    """近半年每个交易日的大盘分位均低于 ceiling"""
-    n = g.pct_regime_lookback
-    if len(g.mkt_pct_history) < n:
-        return False
-    recent = g.mkt_pct_history[-n:]
-    return all(p < g.pct_regime_ceiling for p in recent)
-
-
-def _tc2_buy_blocked_by_pct():
-    """tc2.md：低分位盘 + 当前分位不足 → 不买入"""
-    if not _is_prolonged_low_percentile():
-        return False, ''
-    pct = g.today_market_pct
-    if pct is None:
-        return False, ''
-    if pct < g.pct_buy_floor:
-        return True, (f"近{g.pct_regime_lookback}日分位均<{g.pct_regime_ceiling}%，"
-                      f"当前分位{pct:.1f}%<{g.pct_buy_floor}%，暂停买入")
-    return False, ''
-
-
 def before_trading_start(context):
     """盘前选股，计算持仓股票的死叉信号"""
     g._daily_sells = []
@@ -603,11 +553,6 @@ def before_trading_start(context):
     if not final_pool:
         log.info("⚠️ 今日无符合所有条件的股票，建议空仓观望。")
 
-    score, pct = _record_today_market_score(context)
-    low_regime = _is_prolonged_low_percentile()
-    log.info(f"[大盘分位] score={score:.0f} 历史分位{pct:.1f}% "
-             f"近半年低分位盘={'是' if low_regime else '否'}")
-
     log.info("=" * 60)
 
 def calc_dktd_channel(stock, context):
@@ -658,13 +603,10 @@ def market_open_trade(context):
 
     market_score, mkt_detail = get_market_score(context, with_detail=True)
     position_ratio = calculate_position_ratio(market_score)
-    pct_str = f"{g.today_market_pct:.1f}%" if g.today_market_pct is not None else 'N/A'
-    low_regime = _is_prolonged_low_percentile()
     log.info(f"[大盘分] {market_score:.0f} → 目标仓位{position_ratio:.0%} | "
              f"上证close={mkt_detail['close']:.2f} ma20={mkt_detail['ma20']:.2f} "
              f"ma60={mkt_detail['ma60']:.2f} ret20={mkt_detail['ret20']*100:+.1f}% "
-             f"基础分{mkt_detail['base']} | 分位{pct_str} "
-             f"低分位盘={'是' if low_regime else '否'}")
+             f"基础分{mkt_detail['base']}")
 
     sell_stocks = []
     half_sell_stocks = []
@@ -762,21 +704,11 @@ def market_open_trade(context):
     current_count = len(current_holdings)
 
     # 4. 买入检查
-    can_buy = False
     if not g.today_stocks:
         log.info("今日无候选股票，跳过买入")
     elif current_count >= g.max_holdings:
         log.info(f"当前已满仓{current_count}支，不再买入")
-    elif market_score < 30:
-        log.info(f"大盘评分{market_score:.0f}低于30，暂停买入")
     else:
-        blocked, block_msg = _tc2_buy_blocked_by_pct()
-        if blocked:
-            log.info(block_msg)
-        else:
-            can_buy = True
-
-    if can_buy:
         pre_rank = {item['code']: (i + 1, item['score'])
                     for i, item in enumerate(g.today_stocks[:g.max_stock_output])}
         _refresh_today_stocks_momentum(context)
